@@ -1,0 +1,15 @@
+# Session changelog for the coding agent; never committed.
+CLAUDE_SUMMARY.md
+
+# Editor / IDE noise
+.vscode/
+.idea/
+.vs/
+.cache/
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini

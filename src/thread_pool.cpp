@@ -31,8 +31,13 @@ void ThreadPool::stop() {
                 thread.join();
             }
         }
+        // Set only after every join, so stopped() == true always implies no
+        // worker is still running.
+        stopped_.store(true);
     });
 }
+
+bool ThreadPool::stopped() const noexcept { return stopped_.load(); }
 
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     if (hooks_.on_worker_start) {

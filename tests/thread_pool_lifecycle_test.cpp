@@ -186,4 +186,17 @@ TEST(ThreadPoolLifecycle, StopJoinsWorkersSynchronously) {
     EXPECT_EQ(exited.size(), kWorkers) << "the destructor re-ran the exit hooks after stop()";
 }
 
+TEST(ThreadPoolLifecycle, StoppedReflectsLifecycle) {
+    tsched::ThreadPool pool{4};
+
+    EXPECT_FALSE(pool.stopped()) << "a freshly built pool is running, not stopped";
+
+    pool.stop();
+    // stop() is synchronous, so this needs no waiting of any kind.
+    EXPECT_TRUE(pool.stopped()) << "stopped() should be true as soon as stop() returns";
+
+    pool.stop();
+    EXPECT_TRUE(pool.stopped()) << "a second stop() must not un-stop the pool";
+}
+
 }  // namespace

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <mutex>
@@ -41,12 +42,17 @@ public:
     // Guarding against that is a future behavior, not handled here.
     void stop();
 
+    // False while the pool is running, true once stop() has completed. Safe to
+    // call from any thread. True implies every worker has been joined.
+    bool stopped() const noexcept;
+
 private:
     void worker_loop(std::stop_token stop_token, std::size_t index);
 
     Hooks hooks_;
     std::size_t thread_count_;
     std::once_flag stop_once_;
+    std::atomic<bool> stopped_{false};
 
     // Declared last so it is destroyed first: every worker is stopped and joined
     // before the state above (which workers read) goes away.

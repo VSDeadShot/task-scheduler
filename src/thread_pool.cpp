@@ -16,6 +16,8 @@ ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks)
     }
 }
 
+ThreadPool::~ThreadPool() { stop(); }
+
 std::size_t ThreadPool::size() const noexcept { return thread_count_; }
 
 void ThreadPool::stop() {

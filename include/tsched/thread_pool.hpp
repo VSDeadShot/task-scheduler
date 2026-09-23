@@ -24,6 +24,10 @@ public:
 
     explicit ThreadPool(std::size_t thread_count, Hooks hooks = {});
 
+    // Stops and joins every worker. Destruction and an explicit stop() share one
+    // teardown path, so stopped() ends up true either way.
+    ~ThreadPool();
+
     // Workers hold a pointer back to the pool, so it can be neither copied nor moved.
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;

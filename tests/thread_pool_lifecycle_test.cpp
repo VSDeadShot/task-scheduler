@@ -199,4 +199,45 @@ TEST(ThreadPoolLifecycle, StoppedReflectsLifecycle) {
     EXPECT_TRUE(pool.stopped()) << "a second stop() must not un-stop the pool";
 }
 
+TEST(ThreadPoolLifecycle, DestructorStopsAndJoinsWithoutExplicitStop) {
+    constexpr std::size_t kWorkers = 4;
+
+    std::mutex mutex;
+    std::condition_variable started_cv;
+    std::vector<std::thread::id> started;  // guarded by mutex
+    std::vector<std::thread::id> exited;   // guarded by mutex
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t /*index*/) {
+        {
+            std::lock_guard lock(mutex);
+            started.push_back(std::this_thread::get_id());
+        }
+        started_cv.notify_all();
+    };
+    hooks.on_worker_exit = [&](std::size_t /*index*/) {
+        std::lock_guard lock(mutex);
+        exited.push_back(std::this_thread::get_id());
+    };
+
+    {
+        tsched::ThreadPool pool{kWorkers, hooks};
+
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(started_cv.wait_for(lock, kStartTimeout,
+                                        [&] { return started.size() >= kWorkers; }))
+            << "only " << started.size() << " of " << kWorkers << " workers started";
+        // Deliberately no stop() call: the destructor must do the whole job.
+    }
+
+    // Checked on the very next line, with no waiting: the destructor is
+    // required to have joined every worker before it returned.
+    std::lock_guard lock(mutex);
+    EXPECT_EQ(exited.size(), kWorkers)
+        << "the destructor returned before every worker had exited";
+    const std::set<std::thread::id> start_ids(started.begin(), started.end());
+    const std::set<std::thread::id> exit_ids(exited.begin(), exited.end());
+    EXPECT_EQ(exit_ids, start_ids) << "exit hooks did not run on the worker threads";
+}
+
 }  // namespace

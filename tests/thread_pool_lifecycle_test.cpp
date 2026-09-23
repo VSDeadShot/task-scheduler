@@ -127,4 +127,63 @@ TEST(ThreadPoolLifecycle, EachWorkerGetsUniqueIndex) {
     EXPECT_EQ(threads.size(), kWorkers) << "indices did not arrive on distinct threads";
 }
 
+TEST(ThreadPoolLifecycle, StopJoinsWorkersSynchronously) {
+    constexpr std::size_t kWorkers = 4;
+
+    std::mutex mutex;
+    std::condition_variable started_cv;
+    std::vector<std::thread::id> started;  // guarded by mutex
+    std::vector<std::thread::id> exited;   // guarded by mutex
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t /*index*/) {
+        {
+            std::lock_guard lock(mutex);
+            started.push_back(std::this_thread::get_id());
+        }
+        started_cv.notify_all();
+    };
+    // No notify: nothing waits on exits. stop() itself must be what guarantees
+    // these have all run by the time it returns.
+    hooks.on_worker_exit = [&](std::size_t /*index*/) {
+        std::lock_guard lock(mutex);
+        exited.push_back(std::this_thread::get_id());
+    };
+
+    std::set<std::thread::id> start_ids;
+    std::set<std::thread::id> exit_ids;
+    {
+        tsched::ThreadPool pool{kWorkers, hooks};
+
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(started_cv.wait_for(lock, kStartTimeout,
+                                            [&] { return started.size() >= kWorkers; }))
+                << "only " << started.size() << " of " << kWorkers << " workers started";
+        }  // the lock must be released here: the exit hooks take this same mutex.
+
+        pool.stop();
+
+        // Checked immediately, with no waiting of any kind: an asynchronous
+        // stop() must fail here rather than be papered over by a timeout.
+        {
+            std::lock_guard lock(mutex);
+            EXPECT_EQ(exited.size(), kWorkers)
+                << "stop() returned before every worker had exited";
+            start_ids.insert(started.begin(), started.end());
+            exit_ids.insert(exited.begin(), exited.end());
+        }
+        EXPECT_EQ(exit_ids, start_ids) << "exit hooks did not run on the worker threads";
+
+        pool.stop();  // idempotent: must not hang, crash, or re-run hooks
+        {
+            std::lock_guard lock(mutex);
+            EXPECT_EQ(exited.size(), kWorkers) << "a second stop() re-ran the exit hooks";
+        }
+    }  // destructor after an explicit stop(): must not double-join
+
+    std::lock_guard lock(mutex);
+    EXPECT_EQ(exited.size(), kWorkers) << "the destructor re-ran the exit hooks after stop()";
+}
+
 }  // namespace

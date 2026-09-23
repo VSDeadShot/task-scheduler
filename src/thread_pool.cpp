@@ -18,6 +18,22 @@ ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks)
 
 std::size_t ThreadPool::size() const noexcept { return thread_count_; }
 
+void ThreadPool::stop() {
+    // call_once makes this idempotent and safe from several threads at once: a
+    // concurrent caller blocks here until the first call has finished joining,
+    // so nobody observes a half-stopped pool or joins a thread twice.
+    std::call_once(stop_once_, [this] {
+        for (auto& thread : threads_) {
+            thread.request_stop();
+        }
+        for (auto& thread : threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    });
+}
+
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     if (hooks_.on_worker_start) {
         hooks_.on_worker_start(index);
@@ -31,6 +47,10 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     std::condition_variable_any idle_cv;
     std::unique_lock lock(idle_mutex);
     idle_cv.wait(lock, stop_token, [] { return false; });
+
+    if (hooks_.on_worker_exit) {
+        hooks_.on_worker_exit(index);
+    }
 }
 
 }  // namespace tsched

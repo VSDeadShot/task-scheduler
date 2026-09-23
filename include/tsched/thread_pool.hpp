@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -31,11 +32,21 @@ public:
     // Number of worker threads in the pool.
     std::size_t size() const noexcept;
 
+    // Asks every worker to stop and joins them. Synchronous: once it returns,
+    // no worker is still running and every on_worker_exit hook has already run.
+    // Safe to call more than once; later calls do nothing. The destructor stops
+    // the pool too, so calling this is optional.
+    //
+    // Must NOT be called from a worker thread: a worker would join itself.
+    // Guarding against that is a future behavior, not handled here.
+    void stop();
+
 private:
     void worker_loop(std::stop_token stop_token, std::size_t index);
 
     Hooks hooks_;
     std::size_t thread_count_;
+    std::once_flag stop_once_;
 
     // Declared last so it is destroyed first: every worker is stopped and joined
     // before the state above (which workers read) goes away.

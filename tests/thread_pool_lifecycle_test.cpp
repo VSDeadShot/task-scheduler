@@ -3,9 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <latch>
 #include <mutex>
 #include <numeric>
 #include <set>
@@ -301,6 +303,81 @@ TEST(ThreadPoolLifecycle, IdleWorkersSleepRatherThanSpin) {
     EXPECT_LT(idle_cpu_ms, kMaxIdleCpuMs)
         << kWorkers << " idle workers burned " << idle_cpu_ms << " ms of CPU over a "
         << kIdleWindow.count() << " ms window: they are spinning instead of sleeping";
+}
+
+// Behavior 12: several threads calling stop() at once must all get the full
+// guarantee, not just the first. Every caller, the moment its own stop()
+// returns, must see every worker exited and stopped() == true.
+TEST(ThreadPoolLifecycle, ConcurrentStopCallersAllObserveFullJoin) {
+    constexpr std::size_t kWorkers = 4;
+    constexpr std::size_t kStoppers = 4;
+    // Each exit hook sleeps (outside the lock) so the first stop() takes at
+    // least this long. That makes a broken stop(), one that lets later callers
+    // return before the joins finish, fail every time rather than only when the
+    // scheduler happens to overlap the callers. Correct code is unaffected: a
+    // caller blocked in std::call_once returns only after the joins complete.
+    constexpr auto kExitHookDelay = std::chrono::milliseconds(50);
+
+    std::mutex mutex;
+    std::condition_variable started_cv;
+    std::size_t started = 0;  // guarded by mutex
+    std::size_t exited = 0;   // guarded by mutex
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t /*index*/) {
+        {
+            std::lock_guard lock(mutex);
+            ++started;
+        }
+        started_cv.notify_all();
+    };
+    hooks.on_worker_exit = [&](std::size_t /*index*/) {
+        std::this_thread::sleep_for(kExitHookDelay);
+        std::lock_guard lock(mutex);
+        ++exited;
+    };
+
+    struct Observation {
+        std::size_t exits_seen = 0;
+        bool stopped_seen = false;
+    };
+    std::array<Observation, kStoppers> observed{};  // slot i written only by stopper i
+
+    {
+        tsched::ThreadPool pool{kWorkers, hooks};
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(started_cv.wait_for(lock, kStartTimeout,
+                                            [&] { return started >= kWorkers; }))
+                << "only " << started << " of " << kWorkers << " workers started";
+        }
+
+        // Released together: nobody calls stop() until all have arrived.
+        std::latch ready{static_cast<std::ptrdiff_t>(kStoppers)};
+        {
+            std::vector<std::jthread> stoppers;
+            stoppers.reserve(kStoppers);
+            for (std::size_t i = 0; i < kStoppers; ++i) {
+                stoppers.emplace_back([&, i] {
+                    ready.arrive_and_wait();
+                    pool.stop();
+                    // Recorded the moment this caller's own stop() returns.
+                    const bool stopped_now = pool.stopped();
+                    std::lock_guard lock(mutex);
+                    observed[i] = Observation{exited, stopped_now};
+                });
+            }
+        }  // stoppers joined here, before the pool is destroyed
+    }
+
+    for (std::size_t i = 0; i < kStoppers; ++i) {
+        EXPECT_EQ(observed[i].exits_seen, kWorkers)
+            << "stop() caller " << i << " returned before every worker had exited";
+        EXPECT_TRUE(observed[i].stopped_seen)
+            << "stop() caller " << i << " returned while stopped() was still false";
+    }
+    std::lock_guard lock(mutex);
+    EXPECT_EQ(exited, kWorkers) << "exit hooks ran more than once per worker";
 }
 
 }  // namespace

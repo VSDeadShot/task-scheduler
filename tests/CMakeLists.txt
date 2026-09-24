@@ -12,4 +12,6 @@ target_link_libraries(thread_pool_lifecycle_test
   PRIVATE tsched::tsched GTest::gtest_main tsched_warnings)
 
 include(GoogleTest)
-gtest_discover_tests(thread_pool_lifecycle_test)
+# A deadlocked test (e.g. a hang inside stop()) can't fail on its own: joining a
+# stuck thread just blocks. The timeout makes ctest kill it and report a failure.
+gtest_discover_tests(thread_pool_lifecycle_test PROPERTIES TIMEOUT 60)

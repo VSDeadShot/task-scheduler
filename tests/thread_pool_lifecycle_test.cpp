@@ -12,6 +12,7 @@
 #include <mutex>
 #include <numeric>
 #include <set>
+#include <system_error>
 #include <utility>
 #include <thread>
 #include <type_traits>
@@ -432,6 +433,82 @@ TEST(ThreadPoolLifecycle, ConstructDestroyCyclesStartAndExitEachWorkerOnce) {
             ASSERT_EQ(exits[i].load(), 1) << "worker " << i << " did not exit exactly once";
         }
     }
+}
+
+// S2-1: stop() called from one of the pool's own workers must be rejected with
+// the same error std::thread::join() uses for joining oneself, and must have no
+// effect: nothing stopped, nothing joined, and the pool keeps running.
+TEST(ThreadPoolLifecycle, StopFromOwnWorkerThrowsAndHasNoEffect) {
+    constexpr std::size_t kWorkers = 4;
+    // stop() joins workers in index order, so the last one is joined last: a
+    // check that only fires at its own join would already have stopped the rest.
+    constexpr std::size_t kCaller = kWorkers - 1;
+
+    struct Outcome {
+        bool done = false;
+        bool threw_deadlock_error = false;
+        bool threw_something_else = false;
+        bool stopped_after_throw = false;
+        std::size_t exits_after_throw = 0;
+    };
+
+    std::mutex mutex;
+    std::condition_variable outcome_cv;
+    std::size_t exited = 0;  // guarded by mutex
+    Outcome outcome;         // guarded by mutex
+    std::atomic<tsched::ThreadPool*> pool_ptr{nullptr};
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t index) {
+        if (index != kCaller) {
+            return;
+        }
+        pool_ptr.wait(nullptr);  // until the constructor has returned
+        tsched::ThreadPool* const pool = pool_ptr.load();
+
+        Outcome result;
+        try {
+            pool->stop();  // called on a worker of the very pool being stopped
+        } catch (const std::system_error& e) {
+            result.threw_deadlock_error = e.code() == std::errc::resource_deadlock_would_occur;
+            result.threw_something_else = !result.threw_deadlock_error;
+        } catch (...) {
+            result.threw_something_else = true;
+        }
+        result.stopped_after_throw = pool->stopped();
+        {
+            std::lock_guard lock(mutex);
+            result.exits_after_throw = exited;
+            result.done = true;
+            outcome = result;
+        }
+        outcome_cv.notify_all();
+    };
+    hooks.on_worker_exit = [&](std::size_t /*index*/) {
+        std::lock_guard lock(mutex);
+        ++exited;
+    };
+
+    tsched::ThreadPool pool{kWorkers, hooks};
+    pool_ptr.store(&pool);
+    pool_ptr.notify_all();
+
+    {
+        std::unique_lock lock(mutex);
+        ASSERT_TRUE(outcome_cv.wait_for(lock, kStartTimeout, [&] { return outcome.done; }))
+            << "stop() called from a worker neither returned nor threw";
+        EXPECT_TRUE(outcome.threw_deadlock_error)
+            << "expected std::system_error with resource_deadlock_would_occur";
+        EXPECT_FALSE(outcome.threw_something_else) << "threw, but not the expected error";
+        EXPECT_EQ(outcome.exits_after_throw, 0u)
+            << "the rejected stop() still stopped and joined other workers";
+        EXPECT_FALSE(outcome.stopped_after_throw) << "the rejected stop() marked the pool stopped";
+    }
+
+    EXPECT_FALSE(pool.stopped()) << "the pool should still be running";
+    pool.stop();  // from outside: must work normally
+    std::lock_guard lock(mutex);
+    EXPECT_EQ(exited, kWorkers) << "an outside stop() after the rejected one must exit every worker once";
 }
 
 }  // namespace

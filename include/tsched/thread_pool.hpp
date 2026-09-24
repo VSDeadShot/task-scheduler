@@ -25,7 +25,8 @@ public:
     explicit ThreadPool(std::size_t thread_count, Hooks hooks = {});
 
     // Stops and joins every worker. Destruction and an explicit stop() share one
-    // teardown path, so stopped() ends up true either way.
+    // teardown path, so stopped() ends up true either way. Must not run on one
+    // of this pool's own workers: see stop().
     ~ThreadPool();
 
     // Workers hold a pointer back to the pool, so it can be neither copied nor moved.
@@ -42,8 +43,12 @@ public:
     // Safe to call more than once; later calls do nothing. The destructor stops
     // the pool too, so calling this is optional.
     //
-    // Must NOT be called from a worker thread: a worker would join itself.
-    // Guarding against that is a future behavior, not handled here.
+    // Calling it from one of this pool's own workers (for example from a hook)
+    // throws std::system_error with std::errc::resource_deadlock_would_occur,
+    // the error std::thread::join() uses for joining oneself, and has no effect:
+    // nothing is stopped or joined. Stopping a *different* pool from a worker is
+    // fine. Destroying the pool from one of its own workers terminates the
+    // process, because the destructor calls stop() and cannot throw.
     void stop();
 
     // False while the pool is running, true once stop() has completed. Safe to

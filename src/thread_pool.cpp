@@ -3,9 +3,18 @@
 #include <algorithm>
 #include <condition_variable>
 #include <mutex>
+#include <system_error>
 #include <utility>
 
 namespace tsched {
+
+namespace {
+
+// The pool whose worker_loop is running on this thread, if any. Lets stop()
+// recognise a call from one of its own workers.
+thread_local const ThreadPool* current_worker_pool = nullptr;
+
+}  // namespace
 
 ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks)
     : hooks_(std::move(hooks)), thread_count_(std::max<std::size_t>(thread_count, 1)) {
@@ -21,6 +30,16 @@ ThreadPool::~ThreadPool() { stop(); }
 std::size_t ThreadPool::size() const noexcept { return thread_count_; }
 
 void ThreadPool::stop() {
+    // Must be checked here, before call_once. Inside it, a worker would only fail
+    // at its own join(), after stopping and joining every worker before it; and
+    // if another thread were already inside stop(), the worker would block in
+    // call_once waiting for a call that is itself waiting to join that worker.
+    // An exception escaping call_once's callable is also unsafe under TSan, whose
+    // runtime never resets the flag, so the next stop() would hang.
+    if (current_worker_pool == this) {
+        throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                "ThreadPool::stop() called from one of its own workers");
+    }
     // call_once makes this idempotent and safe from several threads at once: a
     // concurrent caller blocks here until the first call has finished joining,
     // so nobody observes a half-stopped pool or joins a thread twice.
@@ -42,6 +61,8 @@ void ThreadPool::stop() {
 bool ThreadPool::stopped() const noexcept { return stopped_.load(); }
 
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
+    current_worker_pool = this;
+
     if (hooks_.on_worker_start) {
         hooks_.on_worker_start(index);
     }

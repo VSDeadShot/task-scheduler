@@ -511,4 +511,61 @@ TEST(ThreadPoolLifecycle, StopFromOwnWorkerThrowsAndHasNoEffect) {
     EXPECT_EQ(exited, kWorkers) << "an outside stop() after the rejected one must exit every worker once";
 }
 
+// S2-2: a worker that calls stop() while another thread is already inside
+// stop() must get the same rejection as S2-1 instead of deadlocking. Without
+// the entry check the worker would block in call_once, waiting for the outside
+// call, which is itself waiting to join that worker.
+TEST(ThreadPoolLifecycle, StopFromWorkerDuringOutsideStopThrowsInsteadOfHanging) {
+    constexpr std::size_t kWorkers = 4;
+    // stop() joins workers in index order, so the outside stop() is blocked on
+    // worker 0 while worker 0's exit hook runs.
+    constexpr std::size_t kCaller = 0;
+
+    std::mutex mutex;
+    std::size_t exited = 0;             // guarded by mutex
+    bool caller_threw_deadlock_error = false;  // guarded by mutex
+    bool caller_threw_something_else = false;  // guarded by mutex
+    bool caller_returned_normally = false;     // guarded by mutex
+    std::atomic<tsched::ThreadPool*> pool_ptr{nullptr};
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_exit = [&](std::size_t index) {
+        if (index == kCaller) {
+            // The outside stop() has already requested stop and is joining us.
+            tsched::ThreadPool* const pool = pool_ptr.load();
+            bool deadlock_error = false;
+            bool something_else = false;
+            bool returned = false;
+            try {
+                pool->stop();
+                returned = true;
+            } catch (const std::system_error& e) {
+                deadlock_error = e.code() == std::errc::resource_deadlock_would_occur;
+                something_else = !deadlock_error;
+            } catch (...) {
+                something_else = true;
+            }
+            std::lock_guard lock(mutex);
+            caller_threw_deadlock_error = deadlock_error;
+            caller_threw_something_else = something_else;
+            caller_returned_normally = returned;
+        }
+        std::lock_guard lock(mutex);
+        ++exited;
+    };
+
+    tsched::ThreadPool pool{kWorkers, hooks};
+    pool_ptr.store(&pool);  // exit hooks only run once stop() is called below
+
+    pool.stop();  // if the worker's call is not rejected up front, this never returns
+
+    std::lock_guard lock(mutex);
+    EXPECT_TRUE(caller_threw_deadlock_error)
+        << "expected std::system_error with resource_deadlock_would_occur";
+    EXPECT_FALSE(caller_threw_something_else) << "threw, but not the expected error";
+    EXPECT_FALSE(caller_returned_normally) << "stop() from the worker should not succeed";
+    EXPECT_EQ(exited, kWorkers) << "every worker must exit exactly once";
+    EXPECT_TRUE(pool.stopped());
+}
+
 }  // namespace

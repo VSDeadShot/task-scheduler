@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -378,6 +379,59 @@ TEST(ThreadPoolLifecycle, ConcurrentStopCallersAllObserveFullJoin) {
     }
     std::lock_guard lock(mutex);
     EXPECT_EQ(exited, kWorkers) << "exit hooks ran more than once per worker";
+}
+
+// Behavior 13: repeated construct/destroy cycles.
+//
+// Contract pinned here: every worker runs on_worker_start and on_worker_exit
+// exactly once, even if the pool is destroyed before that worker is scheduled.
+//
+// Each pool is destroyed immediately, without waiting for its workers to start,
+// so stop can arrive while workers are still starting up. The earlier tests
+// never reach that interleaving: they all wait for every worker to park first.
+// On even cycles the start hook sleeps 1 ms, so the stop request lands while
+// workers are still inside it, every time. Odd cycles have no delay and leave
+// natural scheduling to produce other orderings, including a stop that arrives
+// before a worker is scheduled at all (covered by chance, not guaranteed).
+//
+// Why the delay: without it, ThreadSanitizer hides this race almost entirely.
+// Its slower thread creation lets workers get past startup before the
+// destructor runs. An injected bug where a worker returns early, skipping its
+// exit hook, if stop was already requested was caught in 20/20 runs with g++
+// but only 6/20 runs under TSan (12 of 4000 cycles). With the delay, every
+// delayed cycle catches it in both configs.
+TEST(ThreadPoolLifecycle, ConstructDestroyCyclesStartAndExitEachWorkerOnce) {
+    constexpr int kCycles = 200;
+    constexpr std::size_t kWorkers = 4;
+    constexpr auto kStartHookDelay = std::chrono::milliseconds(1);
+
+    for (int cycle = 0; cycle < kCycles; ++cycle) {
+        SCOPED_TRACE(testing::Message() << "cycle " << cycle);
+        const bool delay_start = cycle % 2 == 0;
+
+        std::array<std::atomic<int>, kWorkers> starts{};
+        std::array<std::atomic<int>, kWorkers> exits{};
+
+        tsched::ThreadPool::Hooks hooks;
+        hooks.on_worker_start = [&](std::size_t index) {
+            starts[index].fetch_add(1);
+            if (delay_start) {
+                std::this_thread::sleep_for(kStartHookDelay);
+            }
+        };
+        hooks.on_worker_exit = [&](std::size_t index) { exits[index].fetch_add(1); };
+
+        {
+            tsched::ThreadPool pool{kWorkers, hooks};
+        }  // destroyed at once: stop may arrive before any worker has started
+
+        // Per index, not in total: a duplicate paired with a missing hook would
+        // still sum to kWorkers.
+        for (std::size_t i = 0; i < kWorkers; ++i) {
+            ASSERT_EQ(starts[i].load(), 1) << "worker " << i << " did not start exactly once";
+            ASSERT_EQ(exits[i].load(), 1) << "worker " << i << " did not exit exactly once";
+        }
+    }
 }
 
 }  // namespace

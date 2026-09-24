@@ -7,13 +7,13 @@ A from-scratch C++ thread pool / task scheduler library, built to demonstrate re
 - A reusable thread pool: fixed number of worker threads
 - Per-thread work-stealing queues (not a single shared queue) — each worker owns a local deque; idle workers steal from the back of another thread's queue when their own is empty
 - `submit(task)` API that returns a `std::future` so callers can retrieve results/exceptions
-- Thread-safe work-stealing queue (per-deque lock; steal-from-back convention to minimize contention with the owning thread's own push/pop from the front)
+- Thread-safe work-stealing queue (per-deque lock). The owning worker pushes to the back and pops from the front, so each queue is FIFO; idle workers steal from the back. FIFO is chosen for the workload: Slice 3 runs independent `submit()`/`std::future` tasks, and FIFO keeps early submissions from being starved by later ones. A v2 lock-free Chase-Lev deque is inherently LIFO for its owner and would revisit this ordering
 - Graceful shutdown: `stop()`/destruction drains all currently-queued work before threads exit, using `std::jthread` + `std::stop_token` for cooperative cancellation signaling
 - Correctness proven under real concurrent stress, not just single-threaded tests
 - A benchmark harness comparing single-threaded vs pooled execution throughput, and (since work-stealing is now v1 scope) pooled-with-stealing vs pooled-without-stealing under uneven task distribution
 
 ## Non-goals (v1)
-- No priority queue / task priorities (v2 stretch goal — v1 is FIFO within a given thread's queue)
+- No priority queue / task priorities (v2 stretch goal — v1 is FIFO within a given thread's queue: the owner pops tasks in the order they were pushed)
 - No distributed/multi-process scheduling — single-process only
 - No immediate/cancel-pending shutdown mode in v1 — `std::stop_token` already gives a natural hook for this later, but graceful drain is the only shutdown path built and tested in v1
 

@@ -2,6 +2,8 @@
 
 #include <gtest/gtest.h>
 
+#include <optional>
+
 namespace {
 
 // An empty optional is the deque's only emptiness signal (there is no empty()
@@ -15,6 +17,18 @@ TEST(WorkStealingDeque, PopOnEmptyReturnsNothing) {
 TEST(WorkStealingDeque, StealOnEmptyReturnsNothing) {
     tsched::WorkStealingDeque<int> deque;
     EXPECT_FALSE(deque.steal().has_value());
+}
+
+// The owner's queue is FIFO: tasks run in the order they were submitted, so
+// early submissions are not starved by later ones.
+TEST(WorkStealingDeque, OwnerPopsInPushOrder) {
+    tsched::WorkStealingDeque<int> deque;
+    deque.push(1);
+    deque.push(2);
+    deque.push(3);
+    EXPECT_EQ(deque.pop(), std::optional<int>{1});
+    EXPECT_EQ(deque.pop(), std::optional<int>{2});
+    EXPECT_EQ(deque.pop(), std::optional<int>{3});
 }
 
 }  // namespace

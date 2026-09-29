@@ -33,7 +33,14 @@ public:
     }
 
     // Any other thread. Takes the back item, or returns nothing if the deque is empty.
-    std::optional<T> steal() { return std::nullopt; }
+    std::optional<T> steal() {
+        if (items_.empty()) {
+            return std::nullopt;
+        }
+        std::optional<T> item{std::move(items_.back())};
+        items_.pop_back();
+        return item;
+    }
 
 private:
     std::deque<T> items_;

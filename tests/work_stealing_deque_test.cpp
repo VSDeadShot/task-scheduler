@@ -31,4 +31,15 @@ TEST(WorkStealingDeque, OwnerPopsInPushOrder) {
     EXPECT_EQ(deque.pop(), std::optional<int>{3});
 }
 
+// A thief takes the newest item from the back, the end the owner reaches last,
+// so stealing does not disturb the owner's FIFO order at the front.
+TEST(WorkStealingDeque, StealTakesFromTheOppositeEndToPop) {
+    tsched::WorkStealingDeque<int> deque;
+    deque.push(1);
+    deque.push(2);
+    deque.push(3);
+    EXPECT_EQ(deque.steal(), std::optional<int>{3});
+    EXPECT_EQ(deque.pop(), std::optional<int>{1});
+}
+
 }  // namespace

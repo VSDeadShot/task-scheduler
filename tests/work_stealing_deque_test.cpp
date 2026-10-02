@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <barrier>
 #include <cstddef>
 #include <latch>
 #include <memory>
@@ -217,6 +219,96 @@ TEST(WorkStealingDeque, EachItemIsTakenExactlyOnceUnderContention) {
     // Both ends must actually have taken items, or nothing was contended.
     EXPECT_GT(steals, 0);
     EXPECT_GT(pops, 0);
+}
+
+// The tightest race: a deque holds one item, and the owner's pop() and two
+// thieves' steal() reach for it at the same instant. Exactly one of them must
+// get it, the item they get must be the one pushed that round, and nothing
+// may be left behind. Two thieves, so thief-against-thief is raced as well as
+// owner-against-thief.
+//
+// Each round, every thread makes exactly one call whatever comes back, and all
+// checks run after the threads are joined, so a broken deque fails the counts
+// rather than stranding threads at a barrier. Only a deque that itself
+// deadlocks can hang this test, and the ctest timeout catches that.
+TEST(WorkStealingDeque, LastItemGoesToExactlyOneCaller) {
+    constexpr int kRounds = 10'000;
+    constexpr int kThieves = 2;
+    constexpr int kCallers = kThieves + 1;
+
+    std::optional<tsched::WorkStealingDeque<int>> deque;  // fresh each round; it cannot be moved
+    std::array<std::optional<int>, kCallers> results;      // [0] the owner, then one per thief
+    std::barrier round_start{kCallers};
+    std::barrier round_end{kCallers};
+
+    // A barrier wakes its waiters one by one, so the thread that opens it would
+    // get a head start of microseconds. Spinning until every caller has arrived
+    // lines the calls up far more closely. The counter is never reset: a reset
+    // could race a fast thread that is already spinning for the next round.
+    std::atomic<int> arrived{0};
+    auto line_up = [&](int round) {
+        round_start.arrive_and_wait();
+        arrived.fetch_add(1);
+        while (arrived.load() < kCallers * (round + 1)) {
+        }
+    };
+
+    std::vector<std::jthread> thieves;
+    for (int t = 1; t <= kThieves; ++t) {
+        thieves.emplace_back([&, t] {
+            for (int round = 0; round < kRounds; ++round) {
+                line_up(round);
+                results[t] = deque->steal();
+                round_end.arrive_and_wait();
+            }
+        });
+    }
+
+    std::vector<int> no_winner;
+    std::vector<int> several_winners;
+    std::vector<int> wrong_item;
+    std::vector<int> item_left_behind;
+    int owner_wins = 0;
+    int thief_wins = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        deque.emplace();
+        deque->push(round);
+
+        line_up(round);
+        results[0] = deque->pop();
+        round_end.arrive_and_wait();
+
+        int winners = 0;
+        for (int caller = 0; caller < kCallers; ++caller) {
+            if (!results[caller].has_value()) {
+                continue;
+            }
+            ++winners;
+            ++(caller == 0 ? owner_wins : thief_wins);
+            if (*results[caller] != round) {
+                wrong_item.push_back(round);
+            }
+        }
+        if (winners == 0) {
+            no_winner.push_back(round);
+        } else if (winners > 1) {
+            several_winners.push_back(round);
+        }
+        if (deque->pop().has_value()) {
+            item_left_behind.push_back(round);
+        }
+    }
+    thieves.clear();  // joins
+    RecordProperty("owner_wins", owner_wins);
+    RecordProperty("thief_wins", thief_wins);
+
+    EXPECT_EQ(no_winner.size(), 0u) << "first rounds: " << first_indices(no_winner);
+    EXPECT_EQ(several_winners.size(), 0u) << "first rounds: " << first_indices(several_winners);
+    EXPECT_EQ(wrong_item.size(), 0u) << "first rounds: " << first_indices(wrong_item);
+    EXPECT_EQ(item_left_behind.size(), 0u) << "first rounds: " << first_indices(item_left_behind);
+    // Both sides must win some rounds, or the race was never really contested.
+    EXPECT_GT(owner_wins, 0);
+    EXPECT_GT(thief_wins, 0);
 }
 
 }  // namespace

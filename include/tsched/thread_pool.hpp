@@ -19,6 +19,19 @@
 
 namespace tsched {
 
+// Settings for a ThreadPool beyond its size and hooks, for example
+// ThreadPool pool{8, {}, {.stealing = false}}. At namespace scope rather than
+// nested in ThreadPool: a nested struct with default member initializers can't
+// be used as a default argument inside the enclosing class (CWG 1397), and both
+// g++ and clang++ reject it.
+struct PoolOptions {
+    // Whether a worker with nothing of its own takes work queued on other
+    // workers' deques. On by default. Off makes each task wait for the worker it
+    // was routed to, even while others sit idle; that exists for benchmarks
+    // comparing the two, and for tests that need to observe routing.
+    bool stealing = true;
+};
+
 // Fixed-size pool of worker threads, each owning its own work queue.
 class ThreadPool {
 public:
@@ -31,7 +44,7 @@ public:
         std::function<void(std::size_t index)> on_worker_exit;
     };
 
-    explicit ThreadPool(std::size_t thread_count, Hooks hooks = {});
+    explicit ThreadPool(std::size_t thread_count, Hooks hooks = {}, PoolOptions options = {});
 
     // Stops and joins every worker. Destruction and an explicit stop() share one
     // teardown path, so stopped() ends up true either way. Must not run on one
@@ -85,13 +98,14 @@ private:
 
     Hooks hooks_;
     std::size_t thread_count_;
+    bool stealing_;  // PoolOptions::stealing; fixed for the pool's lifetime
     std::once_flag stop_once_;
     std::atomic<bool> stopped_{false};
 
     // Waking. queued_[i] counts the tasks reserved on worker i's deque and not
-    // yet taken by anyone; total_queued_ is their sum. A worker sleeps until some
-    // deque has work, since it can steal from any of them. Never held together
-    // with a deque's lock.
+    // yet taken by anyone; total_queued_ is their sum. With stealing on, a worker
+    // sleeps until some deque has work, since it can take from any of them; with
+    // it off, until its own deque does. Never held together with a deque's lock.
     std::mutex wake_mutex_;
     std::condition_variable_any wake_cv_;
     std::vector<std::size_t> queued_;  // guarded by wake_mutex_

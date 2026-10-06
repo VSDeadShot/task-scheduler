@@ -144,10 +144,20 @@ TEST(ThreadPoolSubmit, ExternalSubmissionsCanAllRunAtOnce) {
 
 // Counts a latch down when it goes out of scope, so a blocked task is always
 // released, even when an assertion ends the test early. Otherwise the pool's
-// destructor would wait forever to join the blocked worker.
+// destructor would wait forever to join the blocked worker. release() lets a
+// test release it earlier; it counts down only once, since counting a latch
+// below zero is undefined.
 struct ReleaseOnExit {
     std::latch& latch;
-    ~ReleaseOnExit() { latch.count_down(); }
+    bool released = false;
+
+    void release() {
+        if (!released) {
+            released = true;
+            latch.count_down();
+        }
+    }
+    ~ReleaseOnExit() { release(); }
 };
 
 // A task submitted from one of the pool's own workers goes onto that worker's
@@ -157,16 +167,16 @@ struct ReleaseOnExit {
 // deque on a 2-worker pool, whatever the starting slot) and not run until the
 // blocker is released.
 //
-// Limitation: once workers can steal, this test can no longer detect misrouting
-// at all. A child sent to the blocked worker's deque would simply be stolen by
-// the parent's idle worker and run on the parent's thread, so every assertion
-// below would still pass. It only keeps that power in a pool that does not steal.
+// Runs with stealing off. With it on, this test could not detect misrouting at
+// all: a child sent to the blocked worker's deque would simply be stolen by the
+// parent's idle worker and run on the parent's thread, so every assertion below
+// would still pass.
 TEST(ThreadPoolSubmit, WorkersOwnSubmissionsStayOnItsDeque) {
     constexpr auto kChildBound = std::chrono::seconds(2);
     // Declared before the pool, and the guard after it: the guard releases the
     // blocker before the pool's destructor joins, and the latch outlives both.
     std::latch release_blocker{1};
-    tsched::ThreadPool pool{2};
+    tsched::ThreadPool pool{2, {}, {.stealing = false}};
     ReleaseOnExit release{release_blocker};
 
     std::future<void> blocker = pool.submit([&release_blocker] { release_blocker.wait(); });
@@ -189,11 +199,15 @@ TEST(ThreadPoolSubmit, WorkersOwnSubmissionsStayOnItsDeque) {
 // The sizes are chosen so that bug fails safely: the 1-worker pool's only index
 // is 0, which is in range for the 2-worker target, so both tasks would land on
 // one deque and run one after the other instead of meeting.
+//
+// The target runs with stealing off. With it on, its idle worker would steal
+// one of the two misrouted tasks, they would still meet, and this test could
+// not detect the bug.
 TEST(ThreadPoolSubmit, WorkerOfAnotherPoolCountsAsExternal) {
     constexpr int kTasks = 2;
     // Declared first so it outlives both pools; `other` is destroyed before `target`.
     Rendezvous rendezvous{kTasks, std::chrono::steady_clock::now() + kRendezvousDeadline};
-    tsched::ThreadPool target{2};
+    tsched::ThreadPool target{2, {}, {.stealing = false}};
     tsched::ThreadPool other{1};
 
     auto meet = [&rendezvous] { return rendezvous.arrive_and_wait(); };
@@ -346,6 +360,52 @@ TEST(ThreadPoolSubmit, IdleWorkerStealsFromABlockedWorker) {
         }
     }
     EXPECT_EQ(ready, kTasks) << "tasks queued behind the blocked worker were left waiting instead of being stolen";
+}
+
+// With stealing turned off, a task waits for the worker it was routed to even
+// while another worker sits idle: the tasks behind a blocked worker stay queued
+// until it is released, and then they all run.
+TEST(ThreadPoolSubmit, StealingCanBeTurnedOff) {
+    constexpr int kTasks = 10;
+    constexpr auto kStartBound = std::chrono::seconds(10);
+    // Long enough for the free worker to finish its own share many times over.
+    constexpr auto kWaitWhileBlocked = std::chrono::seconds(1);
+
+    std::latch release_blocker{1};
+    std::promise<void> blocker_started;
+    std::future<void> started = blocker_started.get_future();
+    tsched::ThreadPool pool{2, {}, {.stealing = false}};
+    ReleaseOnExit release{release_blocker};
+
+    std::future<void> blocker = pool.submit([&] {
+        blocker_started.set_value();
+        release_blocker.wait();
+    });
+    ASSERT_EQ(status_within(started, kStartBound), "ready") << "the blocker never started";
+
+    // Without stealing the blocker runs on the worker it was routed to, and
+    // round-robin puts every other task behind it.
+    std::vector<std::future<void>> queued;
+    for (int i = 0; i < kTasks; ++i) {
+        queued.push_back(pool.submit([] {}));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kWaitWhileBlocked;
+    int ready_while_blocked = 0;
+    for (std::future<void>& result : queued) {
+        if (result.wait_until(deadline) == std::future_status::ready) {
+            ++ready_while_blocked;
+        }
+    }
+    EXPECT_EQ(ready_while_blocked, kTasks / 2) << "tasks behind the blocked worker ran: stealing was not turned off";
+
+    release.release();
+    int ready_after_release = 0;
+    for (std::future<void>& result : queued) {
+        if (status_within(result, kResultBound) == "ready") {
+            ++ready_after_release;
+        }
+    }
+    EXPECT_EQ(ready_after_release, kTasks) << "tasks behind the blocker never ran after it was released";
 }
 
 }  // namespace

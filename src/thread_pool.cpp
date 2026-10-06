@@ -23,9 +23,10 @@ thread_local std::size_t current_worker_index = 0;
 
 }  // namespace
 
-ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks)
+ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks, PoolOptions options)
     : hooks_(std::move(hooks)),
       thread_count_(std::max<std::size_t>(thread_count, 1)),
+      stealing_(options.stealing),
       queued_(thread_count_, 0) {
     // Every deque exists before the first worker starts.
     deques_.reserve(thread_count_);
@@ -93,10 +94,12 @@ void ThreadPool::enqueue(detail::Task task) {
         ++total_queued_;
     }
     deques_[target]->push(std::move(task));
-    // Any worker can now take this task, its target directly and the others by
-    // stealing, so waking one would be enough in principle.
-    // TODO(S3-10): switch to notify_one(), together with the lost-wake-up stress
-    // test that can catch a wrong wake-up policy.
+    // With stealing on, any worker can take this task, its target directly and
+    // the others by stealing, so waking one would be enough in principle. With
+    // stealing off only the target can, and a single notify could wake the
+    // wrong worker, so all are woken either way for now.
+    // TODO(S3-10): switch to notify_one() when stealing is on, together with the
+    // lost-wake-up stress test that can catch a wrong wake-up policy.
     wake_cv_.notify_all();
 }
 
@@ -108,12 +111,17 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
         hooks_.on_worker_start(index);
     }
 
+    // Whether there is work this worker could take: anywhere when it can steal,
+    // otherwise only on its own deque. Read under wake_mutex_.
+    const auto work_available = [this, index] { return stealing_ ? total_queued_ > 0 : queued_[index] > 0; };
+
     while (true) {
-        // Own work first, from the front. Failing that, steal from the back of
-        // each other worker's deque once around, starting with the next one.
+        // Own work first, from the front. Failing that, and if stealing is on,
+        // steal from the back of each other worker's deque once around,
+        // starting with the next one.
         std::size_t taken_from = index;
         std::optional<detail::Task> task = deques_[index]->pop();
-        for (std::size_t offset = 1; !task && offset < thread_count_; ++offset) {
+        for (std::size_t offset = 1; stealing_ && !task && offset < thread_count_; ++offset) {
             taken_from = (index + offset) % thread_count_;
             task = deques_[taken_from]->steal();
         }
@@ -128,7 +136,7 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
         }
 
         std::unique_lock lock{wake_mutex_};
-        if (total_queued_ > 0 && !stop_token.stop_requested()) {
+        if (work_available() && !stop_token.stop_requested()) {
             // Work is counted but the scan found none: another worker took it
             // and has not lowered the count yet, or its push has not landed.
             // Let that thread finish, then look again.
@@ -136,11 +144,11 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
             std::this_thread::yield();
             continue;
         }
-        // Sleep until some deque has work or stop is requested. The count is
-        // checked under the same lock enqueue() takes to raise it, so a
-        // reservation can never slip in between the check and the sleep. The
-        // stop_token wakes the wait when stop is requested, with no notify.
-        const bool has_work = wake_cv_.wait(lock, stop_token, [&] { return total_queued_ > 0; });
+        // Sleep until there is work this worker can take, or stop is requested.
+        // The count is checked under the same lock enqueue() takes to raise it,
+        // so a reservation can never slip in between the check and the sleep.
+        // The stop_token wakes the wait when stop is requested, with no notify.
+        const bool has_work = wake_cv_.wait(lock, stop_token, work_available);
         // TODO(S3-8): drain instead. Until then a worker leaves as soon as stop is
         // requested, even with work queued: those tasks never run, and their
         // futures report broken_promise once the pool (and its deques) is destroyed.

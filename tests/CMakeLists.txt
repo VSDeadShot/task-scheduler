@@ -24,3 +24,4 @@ endfunction()
 
 tsched_add_test(thread_pool_lifecycle_test thread_pool_lifecycle_test.cpp)
 tsched_add_test(work_stealing_deque_test work_stealing_deque_test.cpp)
+tsched_add_test(task_test task_test.cpp)

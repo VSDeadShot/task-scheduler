@@ -88,12 +88,14 @@ private:
     std::once_flag stop_once_;
     std::atomic<bool> stopped_{false};
 
-    // Waking. queued_[i] counts the tasks reserved for worker i that it has not
-    // yet taken; a worker sleeps until its own count is above zero. Never held
-    // together with a deque's lock.
+    // Waking. queued_[i] counts the tasks reserved on worker i's deque and not
+    // yet taken by anyone; total_queued_ is their sum. A worker sleeps until some
+    // deque has work, since it can steal from any of them. Never held together
+    // with a deque's lock.
     std::mutex wake_mutex_;
     std::condition_variable_any wake_cv_;
     std::vector<std::size_t> queued_;  // guarded by wake_mutex_
+    std::size_t total_queued_ = 0;     // guarded by wake_mutex_
 
     // Spreads submissions round-robin across the workers' deques.
     std::atomic<std::size_t> next_external_{0};

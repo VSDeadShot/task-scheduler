@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 namespace tsched {
@@ -89,10 +90,13 @@ void ThreadPool::enqueue(detail::Task task) {
     {
         std::lock_guard lock{wake_mutex_};
         ++queued_[target];
+        ++total_queued_;
     }
     deques_[target]->push(std::move(task));
-    // All workers share one condition variable, and only the target can take
-    // this task, so a single notify could wake the wrong one.
+    // Any worker can now take this task, its target directly and the others by
+    // stealing, so waking one would be enough in principle.
+    // TODO(S3-10): switch to notify_one(), together with the lost-wake-up stress
+    // test that can catch a wrong wake-up policy.
     wake_cv_.notify_all();
 }
 
@@ -105,20 +109,38 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     }
 
     while (true) {
-        if (std::optional<detail::Task> task = deques_[index]->pop()) {
+        // Own work first, from the front. Failing that, steal from the back of
+        // each other worker's deque once around, starting with the next one.
+        std::size_t taken_from = index;
+        std::optional<detail::Task> task = deques_[index]->pop();
+        for (std::size_t offset = 1; !task && offset < thread_count_; ++offset) {
+            taken_from = (index + offset) % thread_count_;
+            task = deques_[taken_from]->steal();
+        }
+        if (task) {
             {
                 std::lock_guard lock{wake_mutex_};
-                --queued_[index];
+                --queued_[taken_from];
+                --total_queued_;
             }
             std::move(*task).run();
             continue;
         }
-        // Sleep until this worker has work of its own or stop is requested. The
-        // count is checked under the same lock enqueue() takes to raise it, so a
+
+        std::unique_lock lock{wake_mutex_};
+        if (total_queued_ > 0 && !stop_token.stop_requested()) {
+            // Work is counted but the scan found none: another worker took it
+            // and has not lowered the count yet, or its push has not landed.
+            // Let that thread finish, then look again.
+            lock.unlock();
+            std::this_thread::yield();
+            continue;
+        }
+        // Sleep until some deque has work or stop is requested. The count is
+        // checked under the same lock enqueue() takes to raise it, so a
         // reservation can never slip in between the check and the sleep. The
         // stop_token wakes the wait when stop is requested, with no notify.
-        std::unique_lock lock{wake_mutex_};
-        const bool has_work = wake_cv_.wait(lock, stop_token, [&] { return queued_[index] > 0; });
+        const bool has_work = wake_cv_.wait(lock, stop_token, [&] { return total_queued_ > 0; });
         // TODO(S3-8): drain instead. Until then a worker leaves as soon as stop is
         // requested, even with work queued: those tasks never run, and their
         // futures report broken_promise once the pool (and its deques) is destroyed.

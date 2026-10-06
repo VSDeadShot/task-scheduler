@@ -308,4 +308,44 @@ TEST(ThreadPoolSubmit, SingleWorkerRunsSubmissionsInOrder) {
     EXPECT_EQ(ran_in_order, submitted_order);
 }
 
+// A worker with nothing of its own takes work queued behind a busy worker,
+// rather than sitting idle while that work waits.
+TEST(ThreadPoolSubmit, IdleWorkerStealsFromABlockedWorker) {
+    constexpr int kTasks = 10;
+    constexpr auto kStartBound = std::chrono::seconds(10);
+    // Plenty for an idle worker to run ten empty tasks; missing it means the
+    // tasks behind the blocker were left waiting.
+    constexpr auto kStealDeadline = std::chrono::seconds(2);
+
+    // Declared before the pool, and the guard after it: the guard releases the
+    // blocker before the pool's destructor joins, and the latch and promise
+    // outlive both.
+    std::latch release_blocker{1};
+    std::promise<void> blocker_started;
+    std::future<void> started = blocker_started.get_future();
+    tsched::ThreadPool pool{2};
+    ReleaseOnExit release{release_blocker};
+
+    std::future<void> blocker = pool.submit([&] {
+        blocker_started.set_value();
+        release_blocker.wait();
+    });
+    ASSERT_EQ(status_within(started, kStartBound), "ready") << "the blocker never started";
+
+    // Round-robin puts every other task on the blocked worker's deque, whichever
+    // worker ended up running the blocker. Only stealing can get those run now.
+    std::vector<std::future<void>> queued;
+    for (int i = 0; i < kTasks; ++i) {
+        queued.push_back(pool.submit([] {}));
+    }
+    const auto deadline = std::chrono::steady_clock::now() + kStealDeadline;
+    int ready = 0;
+    for (std::future<void>& result : queued) {
+        if (result.wait_until(deadline) == std::future_status::ready) {
+            ++ready;
+        }
+    }
+    EXPECT_EQ(ready, kTasks) << "tasks queued behind the blocked worker were left waiting instead of being stolen";
+}
+
 }  // namespace

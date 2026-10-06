@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <system_error>
 #include <utility>
 
@@ -17,7 +19,14 @@ thread_local const ThreadPool* current_worker_pool = nullptr;
 }  // namespace
 
 ThreadPool::ThreadPool(std::size_t thread_count, Hooks hooks)
-    : hooks_(std::move(hooks)), thread_count_(std::max<std::size_t>(thread_count, 1)) {
+    : hooks_(std::move(hooks)),
+      thread_count_(std::max<std::size_t>(thread_count, 1)),
+      queued_(thread_count_, 0) {
+    // Every deque exists before the first worker starts.
+    deques_.reserve(thread_count_);
+    for (std::size_t index = 0; index < thread_count_; ++index) {
+        deques_.push_back(std::make_unique<WorkStealingDeque<detail::Task>>());
+    }
     threads_.reserve(thread_count_);
     for (std::size_t index = 0; index < thread_count_; ++index) {
         threads_.emplace_back(
@@ -60,6 +69,21 @@ void ThreadPool::stop() {
 
 bool ThreadPool::stopped() const noexcept { return stopped_.load(); }
 
+void ThreadPool::enqueue(detail::Task task) {
+    const std::size_t target = 0;
+    // Reserve, then push: a worker woken by the reservation may find its deque
+    // still empty for a moment, and simply looks again. The two locks are taken
+    // one after the other, never together.
+    {
+        std::lock_guard lock{wake_mutex_};
+        ++queued_[target];
+    }
+    deques_[target]->push(std::move(task));
+    // All workers share one condition variable, and only the target can take
+    // this task, so a single notify could wake the wrong one.
+    wake_cv_.notify_all();
+}
+
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     current_worker_pool = this;
 
@@ -67,14 +91,28 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
         hooks_.on_worker_start(index);
     }
 
-    // Park until stop is requested. Slice 2 replaces this with the worker's own
-    // work-stealing deque; for now it keeps each worker alive and asleep rather
-    // than spinning. Waiting on the stop_token means no notify is needed: the
-    // jthread destructor requests stop, which wakes the wait.
-    std::mutex idle_mutex;
-    std::condition_variable_any idle_cv;
-    std::unique_lock lock(idle_mutex);
-    idle_cv.wait(lock, stop_token, [] { return false; });
+    while (true) {
+        if (std::optional<detail::Task> task = deques_[index]->pop()) {
+            {
+                std::lock_guard lock{wake_mutex_};
+                --queued_[index];
+            }
+            std::move(*task).run();
+            continue;
+        }
+        // Sleep until this worker has work of its own or stop is requested. The
+        // count is checked under the same lock enqueue() takes to raise it, so a
+        // reservation can never slip in between the check and the sleep. The
+        // stop_token wakes the wait when stop is requested, with no notify.
+        std::unique_lock lock{wake_mutex_};
+        const bool has_work = wake_cv_.wait(lock, stop_token, [&] { return queued_[index] > 0; });
+        // TODO(S3-8): drain instead. Until then a worker leaves as soon as stop is
+        // requested, even with work queued: those tasks never run, and their
+        // futures report broken_promise once the pool (and its deques) is destroyed.
+        if (!has_work || stop_token.stop_requested()) {
+            break;
+        }
+    }
 
     if (hooks_.on_worker_exit) {
         hooks_.on_worker_exit(index);

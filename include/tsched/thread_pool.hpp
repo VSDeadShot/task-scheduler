@@ -1,11 +1,20 @@
 #pragma once
 
+#include "tsched/detail/task.hpp"
+#include "tsched/work_stealing_deque.hpp"
+
 #include <atomic>
+#include <concepts>
+#include <condition_variable>
 #include <cstddef>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace tsched {
@@ -35,6 +44,21 @@ public:
     ThreadPool(ThreadPool&&) = delete;
     ThreadPool& operator=(ThreadPool&&) = delete;
 
+    // Queues `task` to run on one of the pool's workers and returns a future for
+    // its result. If the task throws, the exception is stored in the future
+    // instead, and the worker carries on with other work.
+    template <typename F>
+        requires std::move_constructible<std::decay_t<F>> && std::invocable<std::decay_t<F>&>
+    std::future<std::invoke_result_t<std::decay_t<F>&>> submit(F&& task) {
+        using R = std::invoke_result_t<std::decay_t<F>&>;
+        std::packaged_task<R()> work{std::forward<F>(task)};
+        std::future<R> result = work.get_future();
+        // Fully built before enqueue() reserves anything, so a failure up to
+        // here leaves the pool untouched.
+        enqueue(detail::Task{std::move(work)});
+        return result;
+    }
+
     // Number of worker threads in the pool.
     std::size_t size() const noexcept;
 
@@ -56,12 +80,24 @@ public:
     bool stopped() const noexcept;
 
 private:
+    void enqueue(detail::Task task);
     void worker_loop(std::stop_token stop_token, std::size_t index);
 
     Hooks hooks_;
     std::size_t thread_count_;
     std::once_flag stop_once_;
     std::atomic<bool> stopped_{false};
+
+    // Waking. queued_[i] counts the tasks reserved for worker i that it has not
+    // yet taken; a worker sleeps until its own count is above zero. Never held
+    // together with a deque's lock.
+    std::mutex wake_mutex_;
+    std::condition_variable_any wake_cv_;
+    std::vector<std::size_t> queued_;  // guarded by wake_mutex_
+
+    // One per worker, by index. Held by pointer because a deque can be neither
+    // copied nor moved.
+    std::vector<std::unique_ptr<WorkStealingDeque<detail::Task>>> deques_;
 
     // Declared last so it is destroyed first: every worker is stopped and joined
     // before the state above (which workers read) goes away.

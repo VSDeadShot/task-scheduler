@@ -10,6 +10,7 @@
 #include <latch>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -282,6 +283,29 @@ TEST(ThreadPoolSubmit, WorkerSurvivesAThrowingTask) {
     }
     EXPECT_EQ(starts.load(), 1);
     EXPECT_EQ(exits.load(), 0) << "the worker exited after a task threw";
+}
+
+// A worker runs its own queue in FIFO order, so on a 1-worker pool, where every
+// task lands in that one queue, tasks run in exactly the order submitted.
+TEST(ThreadPoolSubmit, SingleWorkerRunsSubmissionsInOrder) {
+    constexpr int kTasks = 100;
+    // Written only by the pool's single worker and read only after every
+    // future is ready, which is what makes the writes visible here.
+    std::vector<int> ran_in_order;
+    tsched::ThreadPool pool{1};
+
+    std::vector<std::future<void>> done;
+    for (int i = 0; i < kTasks; ++i) {
+        done.push_back(pool.submit([&ran_in_order, i] { ran_in_order.push_back(i); }));
+    }
+    for (std::future<void>& result : done) {
+        ASSERT_EQ(status_within(result, kResultBound), "ready");
+        result.get();
+    }
+
+    std::vector<int> submitted_order(kTasks);
+    std::iota(submitted_order.begin(), submitted_order.end(), 0);
+    EXPECT_EQ(ran_in_order, submitted_order);
 }
 
 }  // namespace

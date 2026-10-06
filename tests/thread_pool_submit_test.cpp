@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -240,6 +241,21 @@ TEST(ThreadPoolSubmit, VoidAndMoveOnlyTasksRoundTrip) {
     ASSERT_EQ(status_within(back, kResultBound), "ready");
     std::unique_ptr<int> returned = back.get();
     EXPECT_EQ(returned.get(), address) << "the move-only result is not the object the task held";
+}
+
+// A task that throws hands its exception to the caller through its future, with
+// its type and message intact, rather than losing it or replacing it with a value.
+TEST(ThreadPoolSubmit, TaskExceptionReachesItsFuture) {
+    tsched::ThreadPool pool{2};
+    std::future<int> result = pool.submit([]() -> int { throw std::runtime_error("boom"); });
+
+    ASSERT_EQ(status_within(result, kResultBound), "ready");
+    try {
+        result.get();
+        FAIL() << "get() returned instead of rethrowing the task's exception";
+    } catch (const std::runtime_error& error) {
+        EXPECT_EQ(std::string{error.what()}, "boom");
+    }
 }
 
 }  // namespace

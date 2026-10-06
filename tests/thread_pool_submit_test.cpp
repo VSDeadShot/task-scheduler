@@ -7,10 +7,12 @@
 #include <cstddef>
 #include <future>
 #include <latch>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -204,6 +206,40 @@ TEST(ThreadPoolSubmit, WorkerOfAnotherPoolCountsAsExternal) {
         }
     }
     EXPECT_EQ(ran_together, kTasks) << "another pool's worker had its submissions routed as if it were one of ours";
+}
+
+// submit() hands back a future of whatever the task returns: void for a task
+// that returns nothing, and a move-only type for a move-only result. A
+// move-only callable must be accepted at all, since the pool's own tasks
+// (std::packaged_task) can only be moved.
+static_assert(std::is_same_v<decltype(std::declval<tsched::ThreadPool&>().submit([] {})), std::future<void>>,
+              "a task returning nothing must give std::future<void>");
+static_assert(std::is_same_v<decltype(std::declval<tsched::ThreadPool&>().submit(
+                                 [owned = std::unique_ptr<int>{}]() mutable { return std::move(owned); })),
+                             std::future<std::unique_ptr<int>>>,
+              "a move-only task returning a move-only value must be accepted, giving a future of that value");
+
+// A void task's effects are visible once get() returns, and a move-only result
+// comes back as the very object the task held: not a copy, not a default value.
+TEST(ThreadPoolSubmit, VoidAndMoveOnlyTasksRoundTrip) {
+    // A plain bool, not an atomic: get() returning must be what makes the
+    // task's write visible here, and ThreadSanitizer checks that it is.
+    // Declared before the pool so it outlives the task that writes it.
+    bool ran = false;
+    auto owned = std::make_unique<int>(7);
+    int* const address = owned.get();
+    tsched::ThreadPool pool{2};
+
+    std::future<void> done = pool.submit([&ran] { ran = true; });
+    std::future<std::unique_ptr<int>> back = pool.submit([held = std::move(owned)]() mutable { return std::move(held); });
+
+    ASSERT_EQ(status_within(done, kResultBound), "ready");
+    done.get();
+    EXPECT_TRUE(ran) << "get() returned but the void task's write is not visible";
+
+    ASSERT_EQ(status_within(back, kResultBound), "ready");
+    std::unique_ptr<int> returned = back.get();
+    EXPECT_EQ(returned.get(), address) << "the move-only result is not the object the task held";
 }
 
 }  // namespace

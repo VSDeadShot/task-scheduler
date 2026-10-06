@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -256,6 +257,31 @@ TEST(ThreadPoolSubmit, TaskExceptionReachesItsFuture) {
     } catch (const std::runtime_error& error) {
         EXPECT_EQ(std::string{error.what()}, "boom");
     }
+}
+
+// A throwing task does not take its worker down: on a 1-worker pool, the next
+// task still runs, on the same worker, which has neither exited nor restarted.
+TEST(ThreadPoolSubmit, WorkerSurvivesAThrowingTask) {
+    constexpr auto kNextTaskBound = std::chrono::seconds(5);
+    std::atomic<int> starts{0};
+    std::atomic<int> exits{0};
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t /*index*/) { starts.fetch_add(1); };
+    hooks.on_worker_exit = [&](std::size_t /*index*/) { exits.fetch_add(1); };
+    tsched::ThreadPool pool{1, hooks};
+
+    std::future<void> thrower = pool.submit([] { throw std::runtime_error("boom"); });
+    std::future<int> next = pool.submit([] { return 42; });
+
+    // Not an ASSERT, so the exit count below is checked even when this fails;
+    // get() is only called on a ready future, so the test can never block.
+    const std::string next_status = status_within(next, kNextTaskBound);
+    EXPECT_EQ(next_status, "ready") << "the task after a throwing one never ran";
+    if (next_status == "ready") {
+        EXPECT_EQ(next.get(), 42);
+    }
+    EXPECT_EQ(starts.load(), 1);
+    EXPECT_EQ(exits.load(), 0) << "the worker exited after a task threw";
 }
 
 }  // namespace

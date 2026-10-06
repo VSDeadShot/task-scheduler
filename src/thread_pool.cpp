@@ -1,6 +1,7 @@
 #include "tsched/thread_pool.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -12,9 +13,12 @@ namespace tsched {
 
 namespace {
 
-// The pool whose worker_loop is running on this thread, if any. Lets stop()
-// recognise a call from one of its own workers.
+// The pool whose worker_loop is running on this thread, if any, and this
+// worker's index in it. Lets stop() recognise a call from one of its own
+// workers, and lets enqueue() keep a worker's own submissions on its deque.
+// The index means nothing to any other pool.
 thread_local const ThreadPool* current_worker_pool = nullptr;
+thread_local std::size_t current_worker_index = 0;
 
 }  // namespace
 
@@ -70,7 +74,15 @@ void ThreadPool::stop() {
 bool ThreadPool::stopped() const noexcept { return stopped_.load(); }
 
 void ThreadPool::enqueue(detail::Task task) {
-    const std::size_t target = 0;
+    // One of this pool's own workers keeps its submissions on its own deque.
+    // Everyone else, including a worker of some other pool (whose index belongs
+    // to that pool, and may not even be in range here), goes round-robin.
+    // Relaxed is enough: the counter only spreads work. The reservation and
+    // push below are what make the task visible to its worker.
+    const std::size_t target = current_worker_pool == this
+                                   ? current_worker_index
+                                   : next_external_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
+    assert(target < deques_.size());
     // Reserve, then push: a worker woken by the reservation may find its deque
     // still empty for a moment, and simply looks again. The two locks are taken
     // one after the other, never together.
@@ -86,6 +98,7 @@ void ThreadPool::enqueue(detail::Task task) {
 
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     current_worker_pool = this;
+    current_worker_index = index;
 
     if (hooks_.on_worker_start) {
         hooks_.on_worker_start(index);

@@ -95,6 +95,9 @@ private:
     std::condition_variable_any wake_cv_;
     std::vector<std::size_t> queued_;  // guarded by wake_mutex_
 
+    // Spreads submissions round-robin across the workers' deques.
+    std::atomic<std::size_t> next_external_{0};
+
     // One per worker, by index. Held by pointer because a deque can be neither
     // copied nor moved.
     std::vector<std::unique_ptr<WorkStealingDeque<detail::Task>>> deques_;

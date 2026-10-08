@@ -81,9 +81,11 @@ public:
     // Number of worker threads in the pool.
     std::size_t size() const noexcept;
 
-    // Asks every worker to stop and joins them. Synchronous: once it returns,
-    // no worker is still running and every on_worker_exit hook has already run.
-    // From the moment it begins, submit() rejects new work (see submit()).
+    // Asks every worker to stop and joins them, after the workers have run every
+    // task already queued. Synchronous: once it returns, every task accepted
+    // before it began has finished, no worker is still running and every
+    // on_worker_exit hook has already run. From the moment it begins, submit()
+    // rejects new work (see submit()).
     // Safe to call more than once; later calls do nothing. The destructor stops
     // the pool too, so calling this is optional.
     //

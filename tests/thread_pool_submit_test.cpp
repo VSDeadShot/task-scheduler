@@ -430,4 +430,31 @@ TEST(ThreadPoolSubmit, SubmitAfterStopThrows) {
     EXPECT_FALSE(ran.load()) << "the rejected task ran anyway";
 }
 
+// A task accepted just before stop() still runs before stop() returns, even
+// when the worker is only waking up for it as stop is requested. Repeated
+// because the bad interleaving (woken for the task, stop requested before the
+// worker looks) is a race, though one that happens in nearly every round.
+TEST(ThreadPoolSubmit, StopRunsATaskSubmittedJustBeforeIt) {
+    constexpr int kRounds = 1000;
+    constexpr auto kStartBound = std::chrono::seconds(10);
+    int stranded_rounds = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        std::promise<void> worker_started;
+        std::future<void> started = worker_started.get_future();
+        tsched::ThreadPool::Hooks hooks;
+        hooks.on_worker_start = [&worker_started](std::size_t /*index*/) { worker_started.set_value(); };
+        tsched::ThreadPool pool{1, hooks};
+        ASSERT_EQ(status_within(started, kStartBound), "ready") << "round " << round << ": the worker never started";
+
+        std::future<void> done = pool.submit([] {});
+        pool.stop();
+        // stop() is synchronous, so a task it ran has already finished: no wait.
+        if (done.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++stranded_rounds;
+        }
+    }
+    RecordProperty("stranded_rounds", stranded_rounds);
+    EXPECT_EQ(stranded_rounds, 0) << "stop() returned without running a task accepted before it began";
+}
+
 }  // namespace

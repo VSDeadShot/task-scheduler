@@ -149,10 +149,12 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
         }
 
         std::unique_lock lock{wake_mutex_};
-        if (work_available() && !stop_token.stop_requested()) {
+        if (work_available()) {
             // Work is counted but the scan found none: another worker took it
             // and has not lowered the count yet, or its push has not landed.
-            // Let that thread finish, then look again.
+            // Let that thread finish, then look again, even once stop has been
+            // requested: a reservation whose push is still landing is queued
+            // work too, and the drain must run it.
             lock.unlock();
             std::this_thread::yield();
             continue;
@@ -162,10 +164,11 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
         // so a reservation can never slip in between the check and the sleep.
         // The stop_token wakes the wait when stop is requested, with no notify.
         const bool has_work = wake_cv_.wait(lock, stop_token, work_available);
-        // TODO(S3-8): drain instead. Until then a worker leaves as soon as stop is
-        // requested, even with work queued: those tasks never run, and their
-        // futures report broken_promise once the pool (and its deques) is destroyed.
-        if (!has_work || stop_token.stop_requested()) {
+        // The drain: false only when stop is requested and nothing this worker
+        // could take is counted, so a worker woken for work goes back for it
+        // even if stop was requested meanwhile. Once accepting_ is false,
+        // nothing more arrives from outside the pool.
+        if (!has_work) {
             break;
         }
     }

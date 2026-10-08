@@ -457,4 +457,81 @@ TEST(ThreadPoolSubmit, StopRunsATaskSubmittedJustBeforeIt) {
     EXPECT_EQ(stranded_rounds, 0) << "stop() returned without running a task accepted before it began";
 }
 
+// stop() runs every task still queued when it begins before it joins: here
+// twenty tasks waiting behind a blocked worker, plus any submission accepted
+// while the test was finding out that stop() had begun.
+TEST(ThreadPoolSubmit, StopRunsEveryQueuedTaskBeforeJoining) {
+    constexpr int kQueued = 20;
+    constexpr auto kStartBound = std::chrono::seconds(10);
+    constexpr auto kRejectBound = std::chrono::seconds(10);
+    // Only paces the probes, so they don't pile up while the stopper starts;
+    // nothing depends on it for correctness.
+    constexpr auto kProbePace = std::chrono::milliseconds(1);
+
+    std::atomic<int> ran{0};
+    std::atomic<int> probes_ran{0};
+    std::atomic<int> exits{0};
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_exit = [&exits](std::size_t /*index*/) { exits.fetch_add(1); };
+
+    // Destroyed in reverse order: the guard releases the blocker, so the
+    // stopper's stop() can finish and the stopper joins, and only then does
+    // the pool go. An assertion that ends the test early can't deadlock it.
+    std::latch release_blocker{1};
+    std::promise<void> blocker_started;
+    std::future<void> started = blocker_started.get_future();
+    tsched::ThreadPool pool{1, hooks};
+    std::jthread stopper;
+    ReleaseOnExit release{release_blocker};
+
+    std::future<void> blocker = pool.submit([&] {
+        blocker_started.set_value();
+        release_blocker.wait();
+    });
+    ASSERT_EQ(status_within(started, kStartBound), "ready") << "the blocker never started";
+
+    // Behind the blocker on the only worker, so all of them are still queued
+    // when stop() begins.
+    std::vector<std::future<void>> accepted;
+    for (int i = 0; i < kQueued; ++i) {
+        accepted.push_back(pool.submit([&ran] { ran.fetch_add(1); }));
+    }
+
+    stopper = std::jthread{[&pool] { pool.stop(); }};
+
+    // A submission being turned away is the sign that stop() has begun. Probes
+    // accepted before that are real tasks, which stop() must run as well, so
+    // each one is counted.
+    int accepted_probes = 0;
+    std::error_code rejected_with;
+    const auto deadline = std::chrono::steady_clock::now() + kRejectBound;
+    while (!rejected_with && std::chrono::steady_clock::now() < deadline) {
+        try {
+            accepted.push_back(pool.submit([&probes_ran] { probes_ran.fetch_add(1); }));
+            ++accepted_probes;
+            std::this_thread::sleep_for(kProbePace);
+        } catch (const std::system_error& error) {
+            rejected_with = error.code();
+        }
+    }
+    RecordProperty("accepted_probes", accepted_probes);
+    ASSERT_EQ(rejected_with, std::make_error_code(std::errc::operation_canceled))
+        << "submit() was never turned away, so stop() can't be known to have begun";
+
+    release.release();
+    stopper.join();  // stop() has returned
+
+    EXPECT_EQ(ran.load(), kQueued) << "tasks queued before stop() began never ran";
+    EXPECT_EQ(probes_ran.load(), accepted_probes) << "probes accepted before stop() began never ran";
+    // stop() is synchronous, so every task it ran has already finished: no wait.
+    int not_ready = blocker.wait_for(std::chrono::seconds(0)) == std::future_status::ready ? 0 : 1;
+    for (const std::future<void>& result : accepted) {
+        if (result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++not_ready;
+        }
+    }
+    EXPECT_EQ(not_ready, 0) << "futures still pending after stop() returned";
+    EXPECT_EQ(exits.load(), 1);
+}
+
 }  // namespace

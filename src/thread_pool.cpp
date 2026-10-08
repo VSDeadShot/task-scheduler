@@ -59,6 +59,13 @@ void ThreadPool::stop() {
     // concurrent caller blocks here until the first call has finished joining,
     // so nobody observes a half-stopped pool or joins a thread twice.
     std::call_once(stop_once_, [this] {
+        // Turn submissions away before asking anyone to stop. Under the lock
+        // enqueue() reserves with, so each submission is either rejected here
+        // or fully reserved before this point.
+        {
+            std::lock_guard lock{wake_mutex_};
+            accepting_ = false;
+        }
         for (auto& thread : threads_) {
             thread.request_stop();
         }
@@ -90,6 +97,12 @@ void ThreadPool::enqueue(detail::Task task) {
     // one after the other, never together.
     {
         std::lock_guard lock{wake_mutex_};
+        // Checked before reserving, so a rejected submission leaves the pool
+        // untouched; the task is destroyed unrun as the exception unwinds.
+        if (!accepting_) {
+            throw std::system_error(std::make_error_code(std::errc::operation_canceled),
+                                    "ThreadPool::submit() called after stop() began");
+        }
         ++queued_[target];
         ++total_queued_;
     }

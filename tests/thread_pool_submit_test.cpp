@@ -14,6 +14,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -406,6 +407,27 @@ TEST(ThreadPoolSubmit, StealingCanBeTurnedOff) {
         }
     }
     EXPECT_EQ(ready_after_release, kTasks) << "tasks behind the blocker never ran after it was released";
+}
+
+// Once stop() has begun, submit() turns work away with operation_canceled
+// rather than queueing it, and the rejected task never runs.
+TEST(ThreadPoolSubmit, SubmitAfterStopThrows) {
+    // Declared before the pool so it outlives anything the pool could still run.
+    std::atomic<bool> ran{false};
+    std::error_code rejected_with;
+    {
+        tsched::ThreadPool pool{2};
+        pool.stop();
+        try {
+            (void)pool.submit([&ran] { ran.store(true); });
+        } catch (const std::system_error& error) {
+            rejected_with = error.code();
+        }
+    }  // Destroyed here, so a task it had kept anyway would have had its chance to run.
+
+    EXPECT_EQ(rejected_with, std::make_error_code(std::errc::operation_canceled))
+        << "submit() after stop() did not throw operation_canceled";
+    EXPECT_FALSE(ran.load()) << "the rejected task ran anyway";
 }
 
 }  // namespace

@@ -66,8 +66,6 @@ public:
     // runs.
     // TODO(S3-9): keep accepting submissions from the pool's own workers while
     // it drains.
-    // TODO(S3-9a): if queuing fails after the task's slot is reserved, the
-    // reservation is not yet released, and stop() then never returns.
     template <typename F>
         requires std::move_constructible<std::decay_t<F>> && std::invocable<std::decay_t<F>&>
     std::future<std::invoke_result_t<std::decay_t<F>&>> submit(F&& task) {

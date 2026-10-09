@@ -92,9 +92,10 @@ void ThreadPool::enqueue(detail::Task task) {
                                    ? current_worker_index
                                    : next_external_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
     assert(target < deques_.size());
-    // Reserve, then push: a worker woken by the reservation may find its deque
-    // still empty for a moment, and simply looks again. The two locks are taken
-    // one after the other, never together.
+    // Reserve, then push, and roll the reservation back if the push throws: a
+    // worker woken by the reservation may find its deque still empty for a
+    // moment, and simply looks again. The two locks are taken one after the
+    // other, never together.
     {
         std::lock_guard lock{wake_mutex_};
         // Checked before reserving, so a rejected submission queues nothing and
@@ -107,13 +108,23 @@ void ThreadPool::enqueue(detail::Task task) {
         ++queued_[target];
         ++total_queued_;
     }
-    // TODO(S3-9a): nothing rolls the reservation back if push() throws
-    // (bad_alloc from the deque, or system_error from its mutex). The task stays
-    // counted but is never queued, so every worker that could take it (all of
-    // them with stealing on, only the target with it off) keeps rescanning
-    // instead of sleeping, and stop() never returns, because a worker only
-    // leaves once nothing it could take is counted.
-    deques_[target]->push(std::move(task));
+    try {
+        deques_[target]->push(std::move(task));
+    } catch (...) {
+        // bad_alloc from the deque, or system_error from its mutex. A task left
+        // counted but never queued would keep every worker that could take it
+        // rescanning instead of sleeping, and stop() from ever returning, since
+        // a worker only leaves once nothing it could take is counted. No wake-up
+        // is owed: none was sent for this task, and a lower count never gives
+        // a sleeping worker a reason to wake. The task itself was destroyed,
+        // unrun, as push() unwound, and the caller gets the original exception.
+        {
+            std::lock_guard lock{wake_mutex_};
+            --queued_[target];
+            --total_queued_;
+        }
+        throw;
+    }
     // With stealing on, any worker can take this task, its target directly and
     // the others by stealing, so waking one would be enough in principle. With
     // stealing off only the target can, and a single notify could wake the

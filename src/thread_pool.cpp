@@ -97,8 +97,9 @@ void ThreadPool::enqueue(detail::Task task) {
     // one after the other, never together.
     {
         std::lock_guard lock{wake_mutex_};
-        // Checked before reserving, so a rejected submission leaves the pool
-        // untouched; the task is destroyed unrun as the exception unwinds.
+        // Checked before reserving, so a rejected submission queues nothing and
+        // changes no worker's state (only the round-robin position above may
+        // have moved); the task is destroyed unrun as the exception unwinds.
         if (!accepting_) {
             throw std::system_error(std::make_error_code(std::errc::operation_canceled),
                                     "ThreadPool::submit() called after stop() began");
@@ -106,6 +107,12 @@ void ThreadPool::enqueue(detail::Task task) {
         ++queued_[target];
         ++total_queued_;
     }
+    // TODO(S3-9a): nothing rolls the reservation back if push() throws
+    // (bad_alloc from the deque, or system_error from its mutex). The task stays
+    // counted but is never queued, so every worker that could take it (all of
+    // them with stealing on, only the target with it off) keeps rescanning
+    // instead of sleeping, and stop() never returns, because a worker only
+    // leaves once nothing it could take is counted.
     deques_[target]->push(std::move(task));
     // With stealing on, any worker can take this task, its target directly and
     // the others by stealing, so waking one would be enough in principle. With

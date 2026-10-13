@@ -52,7 +52,7 @@ struct ReleaseOnExit {
 // std::deque allocates blocks of _GLIBCXX_DEQUE_BUF_SIZE = 512 bytes for any
 // element smaller than that, and detail::Task is 8 bytes (one pointer), so a
 // block holds 64 tasks. Nothing else submit() allocates for an empty lambda is
-// this size (the task's shared state, its Task holder and its result slot are
+// this size (the task's shared state, its result slot and its Task holder are
 // 64, 16 and 24 bytes). If a different standard library or a different Task
 // layout changes any of that, no submit fails, and the vacuity check below
 // says so instead of the test passing on nothing.

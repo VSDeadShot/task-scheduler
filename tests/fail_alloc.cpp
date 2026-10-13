@@ -19,14 +19,20 @@
 
 namespace {
 
-// Size to fail, or 0 when disarmed; and whether it has failed since arming.
-// Trivially initialized thread_locals, so reading them never allocates.
+// Size to fail, or 0 when disarmed; allocations left until the one to fail
+// (1 = the next one), or 0 when disarmed; and whether either has failed since
+// arming. Trivially initialized thread_locals, so reading them never allocates.
 thread_local std::size_t fail_size = 0;
+thread_local std::size_t fail_countdown = 0;
 thread_local bool failed = false;
 
 void* allocate(std::size_t size) {
     if (fail_size != 0 && size == fail_size) {
         fail_size = 0;  // once only
+        failed = true;
+        throw std::bad_alloc{};
+    }
+    if (fail_countdown != 0 && --fail_countdown == 0) {  // reaching 0 disarms it: once only
         failed = true;
         throw std::bad_alloc{};
     }
@@ -55,5 +61,14 @@ FailNextAllocationOfSize::FailNextAllocationOfSize(std::size_t size) {
 FailNextAllocationOfSize::~FailNextAllocationOfSize() { fail_size = 0; }
 
 bool FailNextAllocationOfSize::fired() const { return failed; }
+
+FailNthAllocation::FailNthAllocation(std::size_t n) {
+    failed = false;
+    fail_countdown = n;
+}
+
+FailNthAllocation::~FailNthAllocation() { fail_countdown = 0; }
+
+bool FailNthAllocation::fired() const { return failed; }
 
 }  // namespace tsched_test

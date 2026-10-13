@@ -25,4 +25,21 @@ public:
     bool fired() const;
 };
 
+// While alive, makes the n-th allocation (counting from 1, any size) on the
+// calling thread throw std::bad_alloc, once. The allocations before it, any
+// after it, and those on other threads are served normally. Arm it around a
+// single call, as above, and never while a FailNextAllocationOfSize is armed:
+// the two share fired().
+class FailNthAllocation {
+public:
+    explicit FailNthAllocation(std::size_t n);
+    ~FailNthAllocation();
+
+    FailNthAllocation(const FailNthAllocation&) = delete;
+    FailNthAllocation& operator=(const FailNthAllocation&) = delete;
+
+    // Whether the n-th allocation was reached, and failed, while this was armed.
+    bool fired() const;
+};
+
 }  // namespace tsched_test

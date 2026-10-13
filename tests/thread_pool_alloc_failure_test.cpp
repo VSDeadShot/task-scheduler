@@ -61,7 +61,8 @@ constexpr std::size_t kDequeBlockBytes = 512;
 // Run with stealing on and off, because each mode reads a different count: with
 // stealing on, a worker decides whether to sleep or leave from total_queued_
 // alone, and queued_[i] only matters with stealing off. A rollback that forgets
-// one of the two counts passes in one mode and fails in the other.
+// one of the two counts, or a reservation left raised on only one of them,
+// passes in one mode and fails in the other.
 class ThreadPoolAllocFailure : public ::testing::TestWithParam<bool> {};
 
 INSTANTIATE_TEST_SUITE_P(, ThreadPoolAllocFailure, ::testing::Bool(),
@@ -162,6 +163,87 @@ TEST_P(ThreadPoolAllocFailure, FailedPushReleasesItsReservation) {
         // Failure path only. The stopper is stuck joining a worker that will
         // never leave, so let both go: the process can still exit, and ctest
         // runs each test in its own process, so nothing else shares it.
+        stopper.detach();
+        static_cast<void>(pool.release());
+    }
+}
+
+// A submit() that fails while building its task leaves the pool untouched:
+// building happens before enqueue() reserves anything, so there is nothing to
+// roll back. Building allocates the packaged_task's shared state and result
+// slot, copies or moves the callable into it, then allocates the Task holder.
+// Rather than depend on how many allocations that is, or on their sizes, the
+// test fails the first one, then the second, and so on, until a submit() gets
+// through without reaching the allocation armed to fail; by then every
+// allocation submit() makes has failed once. A step that left a slot reserved
+// would show up as in FailedPushReleasesItsReservation: a worker rescanning
+// instead of sleeping, and a stop() that never returns.
+TEST_P(ThreadPoolAllocFailure, FailedTaskConstructionReservesNothing) {
+    constexpr std::size_t kMaxSteps = 64;
+    constexpr auto kRunBound = std::chrono::seconds(10);
+    constexpr auto kStopBound = std::chrono::seconds(10);
+    constexpr auto kIdleWindow = std::chrono::milliseconds(250);
+    constexpr double kMaxIdleCpuMs = 50.0;
+
+    std::atomic<int> ran{0};
+    // On the heap so the failure path below can leak it, as above.
+    auto pool = std::make_unique<tsched::ThreadPool>(1, tsched::ThreadPool::Hooks{},
+                                                     tsched::PoolOptions{.stealing = GetParam()});
+
+    int failed_steps = 0;
+    int failures_not_from_seam = 0;
+    bool got_through = false;
+    bool got_through_after_seam_fired = false;
+    std::future<void> accepted;
+    for (std::size_t n = 1; n <= kMaxSteps && !got_through; ++n) {
+        tsched_test::FailNthAllocation fail{n};
+        try {
+            accepted = pool->submit([&ran] { ran.fetch_add(1); });
+            got_through = true;
+            got_through_after_seam_fired = fail.fired();
+        } catch (const std::bad_alloc&) {
+            ++failed_steps;
+            if (!fail.fired()) {
+                ++failures_not_from_seam;
+            }
+        }
+    }
+    RecordProperty("failed_steps", failed_steps);
+    // Guards against a sweep that tests nothing: one that never ends, one in
+    // which no allocation ever failed, and one whose failures weren't ours.
+    ASSERT_TRUE(got_through) << "submit() failed at each of the first " << kMaxSteps
+                             << " allocations and never got through: the seam keeps firing";
+    ASSERT_GE(failed_steps, 1) << "no allocation inside submit() failed: the seam never armed, so nothing was tested";
+    ASSERT_EQ(failures_not_from_seam, 0) << "a bad_alloc did not come from the test's allocation seam";
+    ASSERT_FALSE(got_through_after_seam_fired) << "submit() swallowed the allocation failure instead of throwing it";
+
+    // The submit() that got through came right after a failed one, so the pool
+    // is still usable; and none of the failed steps queued a task that ran.
+    EXPECT_EQ(accepted.wait_for(kRunBound) == std::future_status::ready ? "ready" : "timeout", std::string{"ready"})
+        << "the task submitted after the failed steps never ran";
+    EXPECT_EQ(ran.load(), 1) << "a failed submit's task ran, or the accepted one didn't";
+
+    // The worker has nothing left to do, so it should be asleep.
+    const double cpu_before_ms = process_cpu_ms();
+    std::this_thread::sleep_for(kIdleWindow);
+    const double idle_cpu_ms = process_cpu_ms() - cpu_before_ms;
+    EXPECT_LT(idle_cpu_ms, kMaxIdleCpuMs)
+        << "the idle worker burned " << idle_cpu_ms << " ms of CPU over a " << kIdleWindow.count()
+        << " ms window: it is rescanning for a task a failed submit left reserved";
+
+    // stop() on another thread, with a bound; see FailedPushReleasesItsReservation.
+    auto stop_returned = std::make_shared<std::promise<void>>();
+    std::future<void> stopped = stop_returned->get_future();
+    std::thread stopper{[target = pool.get(), stop_returned] {
+        target->stop();
+        stop_returned->set_value();
+    }};
+    const bool returned = stopped.wait_for(kStopBound) == std::future_status::ready;
+    EXPECT_EQ(returned ? "returned" : "timeout", std::string{"returned"})
+        << "stop() never returned: it is waiting for a task a failed submit left reserved";
+    if (returned) {
+        stopper.join();
+    } else {
         stopper.detach();
         static_cast<void>(pool.release());
     }

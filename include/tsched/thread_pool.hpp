@@ -61,11 +61,12 @@ public:
     // its result. If the task throws, the exception is stored in the future
     // instead, and the worker carries on with other work.
     //
-    // Once stop() has begun, throws std::system_error with
+    // Once stop() has begun, a call from outside the pool (including from a
+    // worker of some other pool) throws std::system_error with
     // std::errc::operation_canceled instead: the task is not queued and never
-    // runs.
-    // TODO(S3-9): keep accepting submissions from the pool's own workers while
-    // it drains.
+    // runs. Calls from the pool's own workers, that is from its running tasks,
+    // are still accepted while it drains, and their tasks run before stop()
+    // returns.
     template <typename F>
         requires std::move_constructible<std::decay_t<F>> && std::invocable<std::decay_t<F>&>
     std::future<std::invoke_result_t<std::decay_t<F>&>> submit(F&& task) {
@@ -85,7 +86,13 @@ public:
     // task already queued. Synchronous: once it returns, every task accepted
     // before it began has finished, no worker is still running and every
     // on_worker_exit hook has already run. From the moment it begins, submit()
-    // rejects new work (see submit()).
+    // rejects new work from outside the pool (see submit()).
+    //
+    // Tasks that running tasks submit during the drain run too, before stop()
+    // returns, so a task that keeps resubmitting work keeps stop() (and the
+    // destructor) from ever returning. Bounding what tasks submit during the
+    // drain is the caller's responsibility.
+    //
     // Safe to call more than once; later calls do nothing. The destructor stops
     // the pool too, so calling this is optional.
     //
@@ -115,8 +122,8 @@ private:
     // yet taken by anyone; total_queued_ is their sum. With stealing on, a worker
     // sleeps until some deque has work, since it can take from any of them; with
     // it off, until its own deque does. accepting_ turns false when stop()
-    // begins, and from then on enqueue() reserves nothing. Never held together
-    // with a deque's lock.
+    // begins, and from then on enqueue() reserves nothing for callers outside
+    // the pool. Never held together with a deque's lock.
     std::mutex wake_mutex_;
     std::condition_variable_any wake_cv_;
     std::vector<std::size_t> queued_;  // guarded by wake_mutex_

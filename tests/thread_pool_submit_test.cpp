@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <functional>
 #include <future>
 #include <latch>
 #include <memory>
@@ -430,6 +431,34 @@ TEST(ThreadPoolSubmit, SubmitAfterStopThrows) {
     EXPECT_FALSE(ran.load()) << "the rejected task ran anyway";
 }
 
+// A worker of some *other* pool is an outsider here even while this pool
+// drains: only this pool's own workers may keep submitting once stop() has
+// begun. Telling the two apart by "is this a worker at all" would let the
+// outsider in, and its task, routed round-robin, could land on a worker that
+// has already left.
+TEST(ThreadPoolSubmit, WorkerOfAnotherPoolIsRejectedAfterStop) {
+    // Declared before the pools so they outlive anything either could still run.
+    std::atomic<bool> ran{false};
+    std::error_code rejected_with;
+    {
+        tsched::ThreadPool target{2};
+        target.stop();
+        tsched::ThreadPool other{1};
+        auto submitted = other.submit([&] {
+            try {
+                (void)target.submit([&ran] { ran.store(true); });
+            } catch (const std::system_error& error) {
+                rejected_with = error.code();
+            }
+        });
+        ASSERT_EQ(status_within(submitted, kResultBound), "ready");
+    }
+
+    EXPECT_EQ(rejected_with, std::make_error_code(std::errc::operation_canceled))
+        << "a worker of another pool was let in after stop()";
+    EXPECT_FALSE(ran.load()) << "the rejected task ran anyway";
+}
+
 // A task accepted just before stop() still runs before stop() returns, even
 // when the worker is only waking up for it as stop is requested. Repeated
 // because the bad interleaving (woken for the task, stop requested before the
@@ -532,6 +561,112 @@ TEST(ThreadPoolSubmit, StopRunsEveryQueuedTaskBeforeJoining) {
     }
     EXPECT_EQ(not_ready, 0) << "futures still pending after stop() returned";
     EXPECT_EQ(exits.load(), 1);
+}
+
+// Run with stealing on and off. Off is the mode that can tell where a drain-time
+// task was queued: one sent anywhere but its submitter's own deque could land on
+// a worker that has already left, and no one else would ever take it. With
+// stealing on, the submitter would simply steal it back.
+class ThreadPoolDrain : public ::testing::TestWithParam<bool> {};
+
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolDrain, ::testing::Bool(), [](const ::testing::TestParamInfo<bool>& info) {
+    return info.param ? "StealingOn" : "StealingOff";
+});
+
+// Tasks that a running task submits while the pool drains are accepted, and run
+// before stop() returns, however long the chain: here a blocked task, released
+// only once stop() has begun and the other worker has already left, starts a
+// chain in which each task submits the next.
+TEST_P(ThreadPoolDrain, TasksSubmittedDuringDrainStillRun) {
+    constexpr int kChain = 100;
+    constexpr auto kStartBound = std::chrono::seconds(10);
+    constexpr auto kExitBound = std::chrono::seconds(10);
+
+    std::atomic<int> exits{0};
+    std::atomic<int> rejected{0};
+    std::atomic<int> chain_ran{0};
+    std::atomic<int> ran_after_stop{0};
+    std::atomic<bool> stop_returned{false};
+    // Link k's future, stored by the task that submitted it. Sized up front, so
+    // each task writes only its own element.
+    std::vector<std::future<void>> links(kChain);
+    // Submits link k. Declared before the pool, and set right after it, so it
+    // outlives anything the pool could still run.
+    std::function<void(int)> submit_link;
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_exit = [&exits](std::size_t /*index*/) { exits.fetch_add(1); };
+
+    // Destroyed in reverse order: the guard releases the blocker, so the
+    // stopper's stop() can finish and the stopper joins, and only then does the
+    // pool go. An assertion that ends the test early can't deadlock it.
+    std::latch release_blocker{1};
+    std::promise<void> blocker_started;
+    std::future<void> started = blocker_started.get_future();
+    tsched::ThreadPool pool{2, hooks, {.stealing = GetParam()}};
+    std::jthread stopper;
+    ReleaseOnExit release{release_blocker};
+
+    submit_link = [&](int k) {
+        try {
+            links[k] = pool.submit([&, k] {
+                if (stop_returned.load()) {
+                    ran_after_stop.fetch_add(1);
+                }
+                chain_ran.fetch_add(1);
+                if (k + 1 < kChain) {
+                    submit_link(k + 1);
+                }
+            });
+        } catch (const std::system_error&) {
+            rejected.fetch_add(1);
+        }
+    };
+
+    std::future<void> blocker = pool.submit([&] {
+        blocker_started.set_value();
+        release_blocker.wait();
+        submit_link(0);
+    });
+    ASSERT_EQ(status_within(started, kStartBound), "ready") << "the blocker never started";
+
+    stopper = std::jthread{[&] {
+        pool.stop();
+        stop_returned.store(true);
+    }};
+
+    // A worker leaves only once stop has been requested, and stop() requests it
+    // only after it has stopped accepting submissions from outside. So once the
+    // idle worker has left, the drain is under way, and every link of the chain
+    // is submitted during it.
+    const auto deadline = std::chrono::steady_clock::now() + kExitBound;
+    while (exits.load() < 1 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(exits.load(), 1) << "the idle worker never left, so the drain can't be known to have begun";
+
+    release.release();
+    stopper.join();  // stop() has returned
+
+    EXPECT_EQ(rejected.load(), 0) << "a running task's submission was turned away during the drain";
+    EXPECT_EQ(chain_ran.load(), kChain) << "stop() returned before the whole chain had run";
+    // stop() is synchronous, so every link it ran has already finished: no wait.
+    // A link that was accepted but never run is still pending here, and one the
+    // pool dropped holds a broken promise.
+    int not_run = 0;
+    for (std::future<void>& link : links) {
+        if (!link.valid() || link.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            ++not_run;
+            continue;
+        }
+        try {
+            link.get();
+        } catch (const std::future_error&) {
+            ++not_run;
+        }
+    }
+    EXPECT_EQ(not_run, 0) << "links never submitted, still pending, or dropped after stop() returned";
+    EXPECT_EQ(exits.load(), 2);
+    ASSERT_EQ(ran_after_stop.load(), 0) << "a link ran after stop() returned";
 }
 
 }  // namespace

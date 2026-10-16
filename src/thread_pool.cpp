@@ -59,9 +59,10 @@ void ThreadPool::stop() {
     // concurrent caller blocks here until the first call has finished joining,
     // so nobody observes a half-stopped pool or joins a thread twice.
     std::call_once(stop_once_, [this] {
-        // Turn submissions away before asking anyone to stop. Under the lock
-        // enqueue() reserves with, so each submission is either rejected here
-        // or fully reserved before this point.
+        // Turn submissions from outside the pool away before asking anyone to
+        // stop. Under the lock enqueue() reserves with, so each of them is
+        // either rejected here or fully reserved before this point. The pool's
+        // own workers can still submit; their work stays on their own deques.
         {
             std::lock_guard lock{wake_mutex_};
             accepting_ = false;
@@ -88,6 +89,12 @@ void ThreadPool::enqueue(detail::Task task) {
     // to that pool, and may not even be in range here), goes round-robin.
     // Relaxed is enough: the counter only spreads work. The reservation and
     // push below are what make the task visible to its worker.
+    //
+    // During the drain this routing is also what keeps a worker's submissions
+    // from being stranded: other workers may already have left, but the
+    // submitter is still running, and it looks at its own deque before it
+    // decides to leave. With stealing off, a task sent to a departed worker's
+    // deque would never be taken.
     const std::size_t target = current_worker_pool == this
                                    ? current_worker_index
                                    : next_external_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
@@ -101,9 +108,12 @@ void ThreadPool::enqueue(detail::Task task) {
         // Checked before reserving, so a rejected submission queues nothing and
         // changes no worker's state (only the round-robin position above may
         // have moved); the task is destroyed unrun as the exception unwinds.
-        if (!accepting_) {
+        // The pool's own workers are let through: a task running during the
+        // drain may still submit work, and that work runs before stop()
+        // returns.
+        if (!accepting_ && current_worker_pool != this) {
             throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-                                    "ThreadPool::submit() called after stop() began");
+                                    "ThreadPool::submit() called from outside the pool after stop() began");
         }
         ++queued_[target];
         ++total_queued_;

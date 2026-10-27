@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -667,6 +669,130 @@ TEST_P(ThreadPoolDrain, TasksSubmittedDuringDrainStillRun) {
     EXPECT_EQ(not_run, 0) << "links never submitted, still pending, or dropped after stop() returned";
     EXPECT_EQ(exits.load(), 2);
     ASSERT_EQ(ran_after_stop.load(), 0) << "a link ran after stop() returned";
+}
+
+// Run with stealing on and off, because the two modes need different workers
+// woken: with stealing on, any sleeping worker can take a new task; with it
+// off, only the worker it was routed to can, and waking any other one leaves
+// the task waiting.
+class ThreadPoolWakeUp : public ::testing::TestWithParam<bool> {};
+
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolWakeUp, ::testing::Bool(), [](const ::testing::TestParamInfo<bool>& info) {
+    return info.param ? "StealingOn" : "StealingOff";
+});
+
+// Every task submitted to a running pool runs while it is still running: no
+// submission's wake-up is lost, however it races the workers going to sleep.
+// Each round, a burst of 1 to 3 submitters, released together, submits one task
+// each to a 4-worker pool, so some worker is always left asleep and which one a
+// wake-up reaches matters. The pause before each round varies: none, so the
+// burst races workers still going back to sleep, or long enough for every
+// worker to be asleep already.
+//
+// Readiness is checked while the pool is running, never after stop(): stop()
+// wakes every worker and drains, so it would run a stranded task and hide the
+// lost wake-up. A stranded task still runs exactly once, at stop(), which the
+// checks after stop() pin separately.
+TEST_P(ThreadPoolWakeUp, NoTaskIsStrandedByALostWakeUp) {
+    using namespace std::chrono_literals;
+    constexpr int kWorkers = 4;
+    constexpr int kSubmitters = 3;
+    constexpr int kRounds = 1000;
+    // Far longer than a woken worker needs, even under TSan; a task still
+    // waiting after it is one that no worker was woken for.
+    constexpr auto kRoundBound = std::chrono::seconds(2);
+    constexpr std::array<std::chrono::microseconds, 4> kGaps{0us, 0us, 100us, 1000us};
+
+    // Slot round * kSubmitters + s belongs to submitter s in that round. Sized
+    // up front, so each submitter writes only its own slots, and declared
+    // before the pool, so they outlive every task.
+    std::vector<std::atomic<int>> runs(kRounds * kSubmitters);
+    std::vector<std::future<void>> results(kRounds * kSubmitters);
+    std::barrier round_start{kSubmitters + 1};
+    std::barrier round_submitted{kSubmitters + 1};
+    // Written by the test thread only between round_submitted and the next
+    // round_start, and read by the submitters after it, so the barrier orders it.
+    bool end_rounds = false;
+    int stranded = 0;
+    int first_stranded_round = -1;
+    int rounds_run = 0;
+    tsched::ThreadPool pool{kWorkers, {}, {.stealing = GetParam()}};
+
+    {
+        std::vector<std::jthread> submitters;
+        for (int s = 0; s < kSubmitters; ++s) {
+            submitters.emplace_back([&, s] {
+                for (int round = 0; round < kRounds; ++round) {
+                    round_start.arrive_and_wait();
+                    if (end_rounds) {
+                        return;
+                    }
+                    if (s < 1 + round % kSubmitters) {
+                        const int slot = round * kSubmitters + s;
+                        results[slot] = pool.submit([&runs, slot] { runs[slot].fetch_add(1); });
+                    }
+                    round_submitted.arrive_and_wait();
+                }
+            });
+        }
+
+        // No assertion inside the rounds: leaving early would strand the
+        // submitters on a barrier. A stranded task ends the rounds instead.
+        for (int round = 0; round < kRounds; ++round) {
+            std::this_thread::sleep_for(kGaps[round % kGaps.size()]);
+            round_start.arrive_and_wait();
+            if (end_rounds) {
+                break;
+            }
+            round_submitted.arrive_and_wait();
+            ++rounds_run;
+            const auto deadline = std::chrono::steady_clock::now() + kRoundBound;
+            for (int s = 0; s < 1 + round % kSubmitters; ++s) {
+                if (results[round * kSubmitters + s].wait_until(deadline) != std::future_status::ready) {
+                    ++stranded;
+                }
+            }
+            if (stranded > 0) {
+                first_stranded_round = round;
+                end_rounds = true;
+            }
+        }
+    }  // every submitter has finished
+
+    pool.stop();
+    RecordProperty("rounds_run", rounds_run);
+    RecordProperty("stranded", stranded);
+    RecordProperty("first_stranded_round", first_stranded_round);
+    EXPECT_EQ(stranded, 0) << "tasks still waiting " << kRoundBound.count()
+                           << " s after submission, with the pool running: a wake-up was lost (first in round "
+                           << first_stranded_round << ")";
+
+    // stop() is synchronous, so every task it ran has already finished: no wait.
+    // A task accepted but never run is still pending here, and one the pool
+    // dropped holds a broken promise.
+    int not_run = 0;
+    int ran_twice = 0;
+    for (int round = 0; round < rounds_run; ++round) {
+        for (int s = 0; s < 1 + round % kSubmitters; ++s) {
+            const int slot = round * kSubmitters + s;
+            std::future<void>& result = results[slot];
+            if (!result.valid() || result.wait_for(std::chrono::seconds(0)) != std::future_status::ready ||
+                runs[slot].load() == 0) {
+                ++not_run;
+                continue;
+            }
+            try {
+                result.get();
+            } catch (const std::future_error&) {
+                ++not_run;
+            }
+            if (runs[slot].load() > 1) {
+                ++ran_twice;
+            }
+        }
+    }
+    EXPECT_EQ(not_run, 0) << "tasks still pending, dropped or never run after stop() returned";
+    EXPECT_EQ(ran_twice, 0) << "tasks that ran more than once";
 }
 
 }  // namespace

@@ -795,4 +795,183 @@ TEST_P(ThreadPoolWakeUp, NoTaskIsStrandedByALostWakeUp) {
     EXPECT_EQ(ran_twice, 0) << "tasks that ran more than once";
 }
 
+// The index of the pool worker running on this thread, set by the
+// on_worker_start hook below; -1 on any other thread.
+thread_local int this_worker = -1;
+
+// Everything the tasks below touch, on the heap and co-owned by every task, so
+// that if stop() never returns and the pool is leaked, its workers still only
+// touch memory they own a share of.
+struct SubmitterRunState {
+    explicit SubmitterRunState(int tasks) : runs(tasks), ran_on(tasks), results(tasks) {
+        for (std::atomic<int>& worker : ran_on) {
+            worker.store(-1);
+        }
+    }
+
+    std::vector<std::atomic<int>> runs;
+    std::vector<std::atomic<int>> ran_on;  // the worker that ran each task
+    // A parent's future is stored by its submitter, a child's by its parent.
+    // Read only once stop() has returned and every worker has been joined.
+    std::vector<std::future<void>> results;
+    std::atomic<int> completed{0};
+};
+
+// How long a parent stays busy after submitting its child, so the child sits on
+// its worker's deque for an idle worker to steal. At namespace scope so a task
+// can use it without capturing it.
+constexpr auto kParentBusy = std::chrono::microseconds(20);
+
+// Run with stealing on and off. With it on, a child its parent left waiting on
+// that worker's deque can be stolen, so the count each worker decrements on a
+// steal is exercised. With it off, nothing is stolen, and each child must run
+// on its parent's worker.
+class ThreadPoolConcurrentSubmit : public ::testing::TestWithParam<bool> {};
+
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolConcurrentSubmit, ::testing::Bool(),
+                         [](const ::testing::TestParamInfo<bool>& info) {
+                             return info.param ? "StealingOn" : "StealingOff";
+                         });
+
+// With several threads submitting at once, and running tasks submitting
+// children, every task runs exactly once, none is left waiting while the pool
+// runs, and stop() still returns. Four submitters, released together, each
+// submit their share of parents as fast as they can; every fourth parent
+// submits one child onto its own worker's deque and then stays busy for a
+// moment, so the child sits there for an idle worker to steal.
+//
+// A count the workers get wrong shows up one of two ways: too low, and workers
+// sleep while tasks are queued, so progress stalls; too high, and workers never
+// find "nothing queued", so they never sleep and stop() never returns. Both
+// are checked with a bound, so neither hangs the test.
+TEST_P(ThreadPoolConcurrentSubmit, EveryTaskRunsExactlyOnceUnderConcurrentSubmitters) {
+    using namespace std::chrono_literals;
+    constexpr int kWorkers = 4;
+    constexpr int kSubmitters = 4;
+    constexpr int kParentsPerSubmitter = 1500;
+    constexpr int kParents = kSubmitters * kParentsPerSubmitter;
+    constexpr int kChildEvery = 4;
+    constexpr int kTasks = kParents + kParents / kChildEvery;
+    // Progress stalled this long, with the pool running, means tasks are queued
+    // that no worker is going to take.
+    constexpr auto kStallBound = std::chrono::seconds(2);
+    constexpr auto kStopBound = std::chrono::seconds(10);
+
+    auto state = std::make_shared<SubmitterRunState>(kTasks);
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [](std::size_t index) { this_worker = static_cast<int>(index); };
+    // On the heap so the failure path below can leak it: destroying a pool
+    // whose stop() never returns would hang the test instead of failing it.
+    auto pool = std::make_unique<tsched::ThreadPool>(kWorkers, hooks, tsched::PoolOptions{.stealing = GetParam()});
+
+    {
+        std::latch start{kSubmitters};
+        std::vector<std::jthread> submitters;
+        for (int s = 0; s < kSubmitters; ++s) {
+            submitters.emplace_back([&start, state, target = pool.get(), s] {
+                start.arrive_and_wait();
+                for (int i = 0; i < kParentsPerSubmitter; ++i) {
+                    const int parent = s * kParentsPerSubmitter + i;
+                    state->results[parent] = target->submit([state, target, parent] {
+                        state->ran_on[parent].store(this_worker);
+                        state->runs[parent].fetch_add(1);
+                        if (parent % kChildEvery == 0) {
+                            const int child = kParents + parent / kChildEvery;
+                            state->results[child] = target->submit([state, child] {
+                                state->ran_on[child].store(this_worker);
+                                state->runs[child].fetch_add(1);
+                                state->completed.fetch_add(1);
+                            });
+                            const auto busy_until = std::chrono::steady_clock::now() + kParentBusy;
+                            while (std::chrono::steady_clock::now() < busy_until) {
+                            }
+                        }
+                        state->completed.fetch_add(1);
+                    });
+                }
+            });
+        }
+    }  // every submitter has finished
+
+    // Wait while tasks keep completing; give up only once none has for a while.
+    int completed = state->completed.load();
+    auto last_progress = std::chrono::steady_clock::now();
+    while (completed < kTasks) {
+        std::this_thread::sleep_for(1ms);
+        const int now_completed = state->completed.load();
+        if (now_completed != completed) {
+            completed = now_completed;
+            last_progress = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - last_progress > kStallBound) {
+            break;
+        }
+    }
+    const int stranded = kTasks - completed;
+    RecordProperty("stranded", stranded);
+    EXPECT_EQ(stranded, 0) << "tasks still waiting, with the pool running, after no task had completed for "
+                           << kStallBound.count() << " s";
+
+    // stop() on another thread, with a bound, as in FailedPushReleasesItsReservation
+    // (thread_pool_alloc_failure_test.cpp). The stopper holds nothing on this stack.
+    auto stop_returned = std::make_shared<std::promise<void>>();
+    std::future<void> stopped = stop_returned->get_future();
+    std::thread stopper{[target = pool.get(), stop_returned] {
+        target->stop();
+        stop_returned->set_value();
+    }};
+    const bool returned = stopped.wait_for(kStopBound) == std::future_status::ready;
+    EXPECT_EQ(returned ? "returned" : "timeout", std::string{"returned"})
+        << "stop() never returned: a worker still sees work queued that isn't there";
+    if (!returned) {
+        // Failure path only. The stopper is stuck joining a worker that will
+        // never leave, so let both go: the process can still exit, and ctest
+        // runs each test in its own process, so nothing else shares it. The
+        // results can't be read safely while workers still run.
+        stopper.detach();
+        static_cast<void>(pool.release());
+        return;
+    }
+    stopper.join();
+
+    // stop() is synchronous, so every task it ran has already finished: no wait.
+    int not_run = 0;
+    int ran_twice = 0;
+    for (int slot = 0; slot < kTasks; ++slot) {
+        std::future<void>& result = state->results[slot];
+        if (!result.valid() || result.wait_for(std::chrono::seconds(0)) != std::future_status::ready ||
+            state->runs[slot].load() == 0) {
+            ++not_run;
+            continue;
+        }
+        try {
+            result.get();
+        } catch (const std::future_error&) {
+            ++not_run;
+        }
+        if (state->runs[slot].load() > 1) {
+            ++ran_twice;
+        }
+    }
+    EXPECT_EQ(not_run, 0) << "tasks still pending, dropped or never run after stop() returned";
+    EXPECT_EQ(ran_twice, 0) << "tasks that ran more than once";
+
+    // A child goes onto its parent's worker's deque, so running anywhere else
+    // means it was stolen, or sent somewhere else to begin with.
+    int children_elsewhere = 0;
+    for (int parent = 0; parent < kParents; parent += kChildEvery) {
+        const int child = kParents + parent / kChildEvery;
+        if (state->ran_on[child].load() != state->ran_on[parent].load()) {
+            ++children_elsewhere;
+        }
+    }
+    RecordProperty("children_elsewhere", children_elsewhere);
+    if (GetParam()) {
+        // Vacuity check: with no child stolen, the counts a steal lowers were
+        // never exercised. Typically hundreds of the 1500 are, even under TSan.
+        EXPECT_GT(children_elsewhere, 0) << "with stealing on, no child was stolen: the steal path never ran";
+    } else {
+        EXPECT_EQ(children_elsewhere, 0) << "with stealing off, children ran on a worker other than their parent's";
+    }
+}
+
 }  // namespace

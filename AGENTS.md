@@ -13,6 +13,7 @@ Rules for the coding agent (Claude Code) working on this project.
 - Every concurrency primitive change needs a test that actually exercises concurrent access, not just a single-threaded call — a thread pool that "compiles and runs once" proves nothing about correctness
 - Treat data races and undefined behavior as the actual risk in this codebase, not a formality — reach for ThreadSanitizer during development on anything touching shared state, and call it out explicitly if it's not available in the environment
 - Per-thread work-stealing queues are locked-in v1 scope, not a premature optimization — build the simple single-thread-queue mental model first within slice 1/2 if that helps get correctness right, but the shipped v1 design is work-stealing, not a single shared queue
+- With stealing on, a submission wakes one worker (`notify_one()`). That is only correct while the workers are `wake_cv_`'s only waiters and all wait for the same condition. Any change that adds another wait on `wake_cv_`, or gives stealing-on workers different wait conditions, must say so in its proposal, then either give the new waiter its own condition variable or go back to `notify_all()`, and extend `NoTaskIsStrandedByALostWakeUp` with that waiter active
 - No other premature optimization (e.g. lock-free structures) before the work-stealing version exists and is benchmarked — that stays a genuine v2 stretch goal
 
 ## Session handoff

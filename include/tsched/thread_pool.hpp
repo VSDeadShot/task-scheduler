@@ -121,7 +121,9 @@ private:
     // Waking. queued_[i] counts the tasks reserved on worker i's deque and not
     // yet taken by anyone; total_queued_ is their sum. With stealing on, a worker
     // sleeps until some deque has work, since it can take from any of them; with
-    // it off, until its own deque does. accepting_ turns false when stop()
+    // it off, until its own deque does. So a submission wakes one sleeping
+    // worker with stealing on, and all of them with it off (see enqueue()); the
+    // workers are wake_cv_'s only waiters. accepting_ turns false when stop()
     // begins, and from then on enqueue() reserves nothing for callers outside
     // the pool. Never held together with a deque's lock.
     std::mutex wake_mutex_;

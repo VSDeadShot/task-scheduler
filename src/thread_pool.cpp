@@ -136,12 +136,21 @@ void ThreadPool::enqueue(detail::Task task) {
         throw;
     }
     // With stealing on, any worker can take this task, its target directly and
-    // the others by stealing, so waking one would be enough in principle. With
-    // stealing off only the target can, and a single notify could wake the
-    // wrong worker, so all are woken either way for now.
-    // TODO(S3-10): switch to notify_one() when stealing is on, together with the
-    // lost-wake-up stress test that can catch a wrong wake-up policy.
-    wake_cv_.notify_all();
+    // the others by stealing, so waking one sleeping worker is enough: they all
+    // sleep until anything at all is counted, and the one woken doesn't sleep
+    // again until nothing is, so either it takes this task or another worker
+    // already has. With stealing off only the target can take it, and a single
+    // notify could reach some other sleeper, which would find nothing of its own
+    // and go back to sleep, leaving the task waiting; so all are woken.
+    //
+    // notify_one() relies on the workers being wake_cv_'s only waiters, all
+    // waiting on the same condition. Anything that ever needs to wait for
+    // something else needs a condition variable of its own.
+    if (stealing_) {
+        wake_cv_.notify_one();
+    } else {
+        wake_cv_.notify_all();
+    }
 }
 
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {

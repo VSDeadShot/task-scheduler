@@ -671,6 +671,109 @@ TEST_P(ThreadPoolDrain, TasksSubmittedDuringDrainStillRun) {
     ASSERT_EQ(ran_after_stop.load(), 0) << "a link ran after stop() returned";
 }
 
+// A worker's on_worker_exit hook runs after the worker has left its loop, and
+// that worker never looks at its deque again, so a task the hook submits could
+// only be stranded there. It is rejected instead, like a submission from
+// outside the pool: the hook only ever runs once stop() has begun. One worker,
+// so no other worker could rescue a stranded task by stealing it.
+TEST_P(ThreadPoolDrain, ExitHookSubmissionIsRejected) {
+    std::atomic<tsched::ThreadPool*> pool_ptr{nullptr};
+    // Written by the exit hook, read only after stop() has joined its worker.
+    bool exit_hook_ran = false;
+    bool accepted = false;
+    std::error_code rejection;  // a copy, so no exception object crosses threads
+    std::future<int> result;
+    std::atomic<bool> ran{false};
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_exit = [&](std::size_t /*index*/) {
+        exit_hook_ran = true;
+        try {
+            result = pool_ptr.load()->submit([&ran] {
+                ran.store(true);
+                return 7;
+            });
+            accepted = true;
+        } catch (const std::system_error& e) {
+            rejection = e.code();
+        }
+    };
+    tsched::ThreadPool pool{1, hooks, {.stealing = GetParam()}};
+    pool_ptr.store(&pool);
+
+    pool.stop();
+
+    ASSERT_TRUE(exit_hook_ran);
+    EXPECT_FALSE(accepted) << "the exit hook's submission was accepted, onto a deque nobody will take from";
+    EXPECT_TRUE(rejection == std::errc::operation_canceled)
+        << "expected operation_canceled, got: '" << rejection.message() << "'";
+    if (accepted) {
+        // stop() is synchronous, so anything it ran has finished: no wait.
+        EXPECT_EQ(status_within(result, std::chrono::milliseconds(0)), "ready")
+            << "accepted, but stop() returned without running it";
+    }
+    EXPECT_FALSE(ran.load());
+}
+
+// A worker's on_worker_start hook runs before the worker enters its loop, so a
+// task it submits lands on a deque that worker is about to look at: it is
+// accepted even once stop() has begun, and runs before stop() returns. Here
+// worker 0's start hook submits only after worker 1 has left, which a worker
+// does only once stop has been requested, and stop() requests it only after it
+// has stopped accepting submissions from outside.
+TEST_P(ThreadPoolDrain, StartHookSubmissionRunsAfterStopHasBegun) {
+    constexpr auto kExitBound = std::chrono::seconds(10);
+
+    std::atomic<tsched::ThreadPool*> pool_ptr{nullptr};
+    std::promise<void> worker1_left;
+    std::future<void> worker1_left_future = worker1_left.get_future();
+    // Written by worker 0's start hook, read only after stop() has joined it.
+    std::string wait_status;
+    bool accepted = false;
+    std::error_code rejection;  // a copy, so no exception object crosses threads
+    std::future<int> result;
+    std::atomic<int> ran{0};
+
+    tsched::ThreadPool::Hooks hooks;
+    hooks.on_worker_start = [&](std::size_t index) {
+        if (index != 0) {
+            return;
+        }
+        // Bounded, so a worker 1 that never leaves fails the test, not hangs it.
+        wait_status = status_within(worker1_left_future, kExitBound);
+        if (wait_status != "ready") {
+            return;
+        }
+        // Set before stop() was called, and stop() has begun, so it is set now.
+        try {
+            result = pool_ptr.load()->submit([&ran] {
+                ran.fetch_add(1);
+                return 7;
+            });
+            accepted = true;
+        } catch (const std::system_error& e) {
+            rejection = e.code();
+        }
+    };
+    hooks.on_worker_exit = [&](std::size_t index) {
+        if (index == 1) {
+            worker1_left.set_value();
+        }
+    };
+    tsched::ThreadPool pool{2, hooks, {.stealing = GetParam()}};
+    pool_ptr.store(&pool);
+
+    pool.stop();
+
+    ASSERT_EQ(wait_status, "ready") << "worker 1 never left, so stop() can't be known to have begun";
+    EXPECT_TRUE(accepted) << "the start hook's submission was rejected: '" << rejection.message() << "'";
+    EXPECT_EQ(ran.load(), 1) << "stop() returned without running the start hook's task exactly once";
+    if (accepted) {
+        EXPECT_EQ(status_within(result, std::chrono::milliseconds(0)), "ready")
+            << "accepted, but stop() returned without running it";
+    }
+}
+
 // Run with stealing on and off, because the two modes need different workers
 // woken: with stealing on, any sleeping worker can take a new task; with it
 // off, only the worker it was routed to can, and waking any other one leaves

@@ -20,6 +20,11 @@ namespace {
 // The index means nothing to any other pool.
 thread_local const ThreadPool* current_worker_pool = nullptr;
 thread_local std::size_t current_worker_index = 0;
+// Whether this worker will still look at its own deque: true from the start of
+// worker_loop, on_worker_start included, until it leaves its loop. Only
+// meaningful together with current_worker_pool, which, unlike this, stays set
+// through on_worker_exit.
+thread_local bool current_worker_takes_work = false;
 
 }  // namespace
 
@@ -84,20 +89,26 @@ void ThreadPool::stop() {
 bool ThreadPool::stopped() const noexcept { return stopped_.load(); }
 
 void ThreadPool::enqueue(detail::Task task) {
-    // One of this pool's own workers keeps its submissions on its own deque.
-    // Everyone else, including a worker of some other pool (whose index belongs
-    // to that pool, and may not even be in range here), goes round-robin.
-    // Relaxed is enough: the counter only spreads work. The reservation and
-    // push below are what make the task visible to its worker.
+    // One of this pool's own workers that will still look at its deque, from
+    // a running task or from on_worker_start, keeps its submissions on that
+    // deque. Everyone else, including a worker of some other pool (whose index
+    // belongs to that pool, and may not even be in range here), goes
+    // round-robin. Relaxed is enough: the counter only spreads work. The
+    // reservation and push below are what make the task visible to its worker.
     //
     // During the drain this routing is also what keeps a worker's submissions
     // from being stranded: other workers may already have left, but the
     // submitter is still running, and it looks at its own deque before it
     // decides to leave. With stealing off, a task sent to a departed worker's
     // deque would never be taken.
-    const std::size_t target = current_worker_pool == this
-                                   ? current_worker_index
-                                   : next_external_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
+    //
+    // A worker that has left its loop (that is, one running on_worker_exit) no
+    // longer counts as one of the pool's own here: it will never look at its
+    // deque again, so it is treated like an outside caller, and is rejected,
+    // since a worker only leaves its loop once stop() has begun.
+    const bool own_worker = current_worker_pool == this && current_worker_takes_work;
+    const std::size_t target =
+        own_worker ? current_worker_index : next_external_.fetch_add(1, std::memory_order_relaxed) % thread_count_;
     assert(target < deques_.size());
     // Reserve, then push, and roll the reservation back if the push throws: a
     // worker woken by the reservation may find its deque still empty for a
@@ -111,9 +122,10 @@ void ThreadPool::enqueue(detail::Task task) {
         // The pool's own workers are let through: a task running during the
         // drain may still submit work, and that work runs before stop()
         // returns.
-        if (!accepting_ && current_worker_pool != this) {
+        if (!accepting_ && !own_worker) {
             throw std::system_error(std::make_error_code(std::errc::operation_canceled),
-                                    "ThreadPool::submit() called from outside the pool after stop() began");
+                                    "ThreadPool::submit() called after stop() began, from outside the pool or "
+                                    "from a worker that has finished draining");
         }
         ++queued_[target];
         ++total_queued_;
@@ -156,6 +168,10 @@ void ThreadPool::enqueue(detail::Task task) {
 void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
     current_worker_pool = this;
     current_worker_index = index;
+    // Before on_worker_start, so a task the hook submits goes onto this
+    // worker's own deque, which the loop below looks at first; it is accepted
+    // even if stop() has already begun.
+    current_worker_takes_work = true;
 
     if (hooks_.on_worker_start) {
         hooks_.on_worker_start(index);
@@ -209,6 +225,13 @@ void ThreadPool::worker_loop(std::stop_token stop_token, std::size_t index) {
             break;
         }
     }
+
+    // This worker never looks at its deque again, so from here on submit()
+    // treats it as an outside caller: a task on_worker_exit submits is rejected
+    // instead of being left where nobody will take it. current_worker_pool
+    // stays set, so stop() still recognises this thread as one of its workers
+    // and throws, instead of joining it from inside itself.
+    current_worker_takes_work = false;
 
     if (hooks_.on_worker_exit) {
         hooks_.on_worker_exit(index);

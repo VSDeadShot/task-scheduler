@@ -39,6 +39,13 @@ public:
     // thread-local setup. Both run *on the worker thread itself*, never on the
     // thread that built the pool. A hook that throws terminates the process:
     // it escapes the thread's entry point, which the pool does not intercept.
+    //
+    // A hook may submit() to its own pool. From on_worker_start the task is
+    // accepted even if stop() has already begun, and that worker runs it before
+    // stop() returns. on_worker_exit runs only once stop() has begun and the
+    // worker has finished draining, so a submission from it is rejected like one
+    // from outside the pool (see submit()). Calling stop() from either hook
+    // throws (see stop()).
     struct Hooks {
         std::function<void(std::size_t index)> on_worker_start;
         std::function<void(std::size_t index)> on_worker_exit;
@@ -64,9 +71,11 @@ public:
     // Once stop() has begun, a call from outside the pool (including from a
     // worker of some other pool) throws std::system_error with
     // std::errc::operation_canceled instead: the task is not queued and never
-    // runs. Calls from the pool's own workers, that is from its running tasks,
-    // are still accepted while it drains, and their tasks run before stop()
-    // returns.
+    // runs. Calls from the pool's own workers, that is from its running tasks
+    // and its on_worker_start hook, are still accepted while it drains, and
+    // their tasks run before stop() returns. A call from on_worker_exit comes
+    // after its worker has finished draining, and is rejected like one from
+    // outside.
     template <typename F>
         requires std::move_constructible<std::decay_t<F>> && std::invocable<std::decay_t<F>&>
     std::future<std::invoke_result_t<std::decay_t<F>&>> submit(F&& task) {

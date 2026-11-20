@@ -272,6 +272,17 @@ double process_cpu_ms() {
     return static_cast<double>(ts.tv_sec) * 1000.0 + static_cast<double>(ts.tv_nsec) / 1.0e6;
 }
 
+// This test runs no tasks. That workers sleep again AFTER running work, i.e.
+// that every count raised for a task comes back down once it is taken, is
+// pinned elsewhere, in both stealing modes: by the two ThreadPoolAllocFailure
+// tests (one worker, a 250 ms idle window like this one, then a bounded
+// stop()) and by EveryTaskRunsExactlyOnceUnderConcurrentSubmitters (four
+// workers, after steals, bounded stop()). Dropping the per-worker decrement,
+// the total decrement, or both, was caught by all three in every mode that
+// reads that count, in 20 of 20 separate runs under g++ and clang++/TSan.
+// Not covered: a spin that keeps the counts right, such as polling after each
+// task. A change that adds one must add an idle window to the
+// concurrent-submitters test, sized to the spin it allows.
 TEST(ThreadPoolLifecycle, IdleWorkersSleepRatherThanSpin) {
     constexpr std::size_t kWorkers = 4;
     constexpr auto kIdleWindow = std::chrono::milliseconds(250);

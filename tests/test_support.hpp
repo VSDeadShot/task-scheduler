@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <latch>
 #include <memory>
@@ -94,10 +95,19 @@ inline std::string stealing_param_name(const ::testing::TestParamInfo<bool>& inf
 // For the same reason, anything a leaked worker could still touch, such as
 // state a still-queued task refers to, must be on the heap and co-owned by the
 // tasks, and the test must not read task results after a false.
-[[nodiscard]] inline bool stop_within(std::unique_ptr<tsched::ThreadPool>& pool, std::chrono::milliseconds bound) {
+//
+// `before_stop`, if given, runs on the stopper thread immediately before it
+// calls stop(), so a test can tell when stop() actually began rather than when
+// it asked for it (the stopper thread may take a while to be scheduled). It is
+// moved onto the stopper thread, so it must not refer to the caller's stack.
+[[nodiscard]] inline bool stop_within(std::unique_ptr<tsched::ThreadPool>& pool, std::chrono::milliseconds bound,
+                                      std::function<void()> before_stop = {}) {
     auto stop_returned = std::make_shared<std::promise<void>>();
     std::future<void> stopped = stop_returned->get_future();
-    std::thread stopper{[target = pool.get(), stop_returned] {
+    std::thread stopper{[target = pool.get(), stop_returned, before_stop = std::move(before_stop)] {
+        if (before_stop) {
+            before_stop();
+        }
         target->stop();
         stop_returned->set_value();
     }};

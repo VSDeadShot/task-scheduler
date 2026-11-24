@@ -28,6 +28,7 @@ tsched_add_test(thread_pool_lifecycle_test thread_pool_lifecycle_test.cpp)
 tsched_add_test(work_stealing_deque_test work_stealing_deque_test.cpp)
 tsched_add_test(task_test task_test.cpp)
 tsched_add_test(thread_pool_submit_test thread_pool_submit_test.cpp)
+tsched_add_test(thread_pool_shutdown_test thread_pool_shutdown_test.cpp)
 
 # fail_alloc.cpp replaces the global operator new, so it gets an executable of
 # its own: no other test should run with a replaced allocator.

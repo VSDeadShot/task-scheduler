@@ -1,3 +1,4 @@
+#include "test_support.hpp"
 #include "tsched/thread_pool.hpp"
 
 #include <gtest/gtest.h>
@@ -25,22 +26,10 @@
 
 namespace {
 
-// Whether the future holds a result within `wait`, by name, so a failed check
-// reads "timeout" rather than the raw bytes GoogleTest prints for
-// std::future_status. Waiting with a bound means a wiring bug fails the test
-// instead of hanging it.
-template <typename T>
-std::string status_within(const std::future<T>& result, std::chrono::milliseconds wait) {
-    switch (result.wait_for(wait)) {
-        case std::future_status::ready:
-            return "ready";
-        case std::future_status::timeout:
-            return "timeout";
-        case std::future_status::deferred:
-            return "deferred";
-    }
-    return "unknown";
-}
+using tsched_test::ReleaseOnExit;
+using tsched_test::status_within;
+using tsched_test::stealing_param_name;
+using tsched_test::stop_within;
 
 constexpr auto kResultTimeout = std::chrono::milliseconds(5000);
 
@@ -145,24 +134,6 @@ TEST(ThreadPoolSubmit, ExternalSubmissionsCanAllRunAtOnce) {
     }
     EXPECT_EQ(ran_together, kWorkers) << "tasks were queued behind one another instead of running at once";
 }
-
-// Counts a latch down when it goes out of scope, so a blocked task is always
-// released, even when an assertion ends the test early. Otherwise the pool's
-// destructor would wait forever to join the blocked worker. release() lets a
-// test release it earlier; it counts down only once, since counting a latch
-// below zero is undefined.
-struct ReleaseOnExit {
-    std::latch& latch;
-    bool released = false;
-
-    void release() {
-        if (!released) {
-            released = true;
-            latch.count_down();
-        }
-    }
-    ~ReleaseOnExit() { release(); }
-};
 
 // A task submitted from one of the pool's own workers goes onto that worker's
 // own deque, so it runs on that worker next rather than queueing behind some
@@ -571,9 +542,7 @@ TEST(ThreadPoolSubmit, StopRunsEveryQueuedTaskBeforeJoining) {
 // stealing on, the submitter would simply steal it back.
 class ThreadPoolDrain : public ::testing::TestWithParam<bool> {};
 
-INSTANTIATE_TEST_SUITE_P(, ThreadPoolDrain, ::testing::Bool(), [](const ::testing::TestParamInfo<bool>& info) {
-    return info.param ? "StealingOn" : "StealingOff";
-});
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolDrain, ::testing::Bool(), stealing_param_name);
 
 // Tasks that a running task submits while the pool drains are accepted, and run
 // before stop() returns, however long the chain: here a blocked task, released
@@ -780,9 +749,7 @@ TEST_P(ThreadPoolDrain, StartHookSubmissionRunsAfterStopHasBegun) {
 // the task waiting.
 class ThreadPoolWakeUp : public ::testing::TestWithParam<bool> {};
 
-INSTANTIATE_TEST_SUITE_P(, ThreadPoolWakeUp, ::testing::Bool(), [](const ::testing::TestParamInfo<bool>& info) {
-    return info.param ? "StealingOn" : "StealingOff";
-});
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolWakeUp, ::testing::Bool(), stealing_param_name);
 
 // Every task submitted to a running pool runs while it is still running: no
 // submission's wake-up is lost, however it races the workers going to sleep.
@@ -931,10 +898,7 @@ constexpr auto kParentBusy = std::chrono::microseconds(20);
 // on its parent's worker.
 class ThreadPoolConcurrentSubmit : public ::testing::TestWithParam<bool> {};
 
-INSTANTIATE_TEST_SUITE_P(, ThreadPoolConcurrentSubmit, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) {
-                             return info.param ? "StealingOn" : "StealingOff";
-                         });
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolConcurrentSubmit, ::testing::Bool(), stealing_param_name);
 
 // With several threads submitting at once, and running tasks submitting
 // children, every task runs exactly once, none is left waiting while the pool
@@ -1014,27 +978,16 @@ TEST_P(ThreadPoolConcurrentSubmit, EveryTaskRunsExactlyOnceUnderConcurrentSubmit
     EXPECT_EQ(stranded, 0) << "tasks still waiting, with the pool running, after no task had completed for "
                            << kStallBound.count() << " s";
 
-    // stop() on another thread, with a bound, as in FailedPushReleasesItsReservation
-    // (thread_pool_alloc_failure_test.cpp). The stopper holds nothing on this stack.
-    auto stop_returned = std::make_shared<std::promise<void>>();
-    std::future<void> stopped = stop_returned->get_future();
-    std::thread stopper{[target = pool.get(), stop_returned] {
-        target->stop();
-        stop_returned->set_value();
-    }};
-    const bool returned = stopped.wait_for(kStopBound) == std::future_status::ready;
+    // stop() with a bound, so a stop() that never returns fails the test
+    // instead of hanging it; on that failure the pool is leaked (see
+    // stop_within()).
+    const bool returned = stop_within(pool, kStopBound);
     EXPECT_EQ(returned ? "returned" : "timeout", std::string{"returned"})
         << "stop() never returned: a worker still sees work queued that isn't there";
     if (!returned) {
-        // Failure path only. The stopper is stuck joining a worker that will
-        // never leave, so let both go: the process can still exit, and ctest
-        // runs each test in its own process, so nothing else shares it. The
-        // results can't be read safely while workers still run.
-        stopper.detach();
-        static_cast<void>(pool.release());
+        // The results can't be read safely while workers still run.
         return;
     }
-    stopper.join();
 
     // stop() is synchronous, so every task it ran has already finished: no wait.
     int not_run = 0;

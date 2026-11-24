@@ -1,6 +1,7 @@
 // Tests that need a failing allocation. Linked with fail_alloc.cpp, which
 // replaces the global operator new for this executable only.
 #include "fail_alloc.hpp"
+#include "test_support.hpp"
 #include "tsched/thread_pool.hpp"
 
 #include <gtest/gtest.h>
@@ -17,36 +18,12 @@
 #include <utility>
 #include <vector>
 
-#include <time.h>  // clock_gettime, CLOCK_PROCESS_CPUTIME_ID (POSIX)
-
 namespace {
 
-// Copied from thread_pool_lifecycle_test.cpp (behavior 10), which explains the
-// method, its margins and its POSIX-only limitation: process CPU time, all
-// threads, in milliseconds.
-double process_cpu_ms() {
-    ::timespec ts{};
-    if (::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) {
-        ADD_FAILURE() << "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) failed";
-    }
-    return static_cast<double>(ts.tv_sec) * 1000.0 + static_cast<double>(ts.tv_nsec) / 1.0e6;
-}
-
-// Counts a latch down when it goes out of scope, so a blocked task is always
-// released, even when an assertion ends the test early. release() lets a test
-// release it earlier; it counts down only once.
-struct ReleaseOnExit {
-    std::latch& latch;
-    bool released = false;
-
-    void release() {
-        if (!released) {
-            released = true;
-            latch.count_down();
-        }
-    }
-    ~ReleaseOnExit() { release(); }
-};
+using tsched_test::process_cpu_ms;
+using tsched_test::ReleaseOnExit;
+using tsched_test::stealing_param_name;
+using tsched_test::stop_within;
 
 // The allocation a deque push makes when its current block is full. libstdc++'s
 // std::deque allocates blocks of _GLIBCXX_DEQUE_BUF_SIZE = 512 bytes for any
@@ -65,10 +42,7 @@ constexpr std::size_t kDequeBlockBytes = 512;
 // passes in one mode and fails in the other.
 class ThreadPoolAllocFailure : public ::testing::TestWithParam<bool> {};
 
-INSTANTIATE_TEST_SUITE_P(, ThreadPoolAllocFailure, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) {
-                             return info.param ? "StealingOn" : "StealingOff";
-                         });
+INSTANTIATE_TEST_SUITE_P(, ThreadPoolAllocFailure, ::testing::Bool(), stealing_param_name);
 
 // A submit() whose push fails after its slot was reserved leaves the pool as if
 // it had never been called: the reservation is released, so the idle worker
@@ -144,28 +118,12 @@ TEST_P(ThreadPoolAllocFailure, FailedPushReleasesItsReservation) {
         << "the idle worker burned " << idle_cpu_ms << " ms of CPU over a " << kIdleWindow.count()
         << " ms window: it is rescanning for the failed submit's task instead of sleeping";
 
-    // stop() on another thread, with a bound, so a stop() that never returns
-    // fails the test instead of hanging it. The stopper holds nothing on this
-    // stack: if it is left behind below and stop() returns late after all, it
-    // only touches the leaked pool and a promise it shares ownership of.
-    auto stop_returned = std::make_shared<std::promise<void>>();
-    std::future<void> stopped = stop_returned->get_future();
-    std::thread stopper{[target = pool.get(), stop_returned] {
-        target->stop();
-        stop_returned->set_value();
-    }};
-    const bool returned = stopped.wait_for(kStopBound) == std::future_status::ready;
+    // stop() with a bound, so a stop() that never returns fails the test
+    // instead of hanging it; on that failure the pool is leaked (see
+    // stop_within()).
+    const bool returned = stop_within(pool, kStopBound);
     EXPECT_EQ(returned ? "returned" : "timeout", std::string{"returned"})
         << "stop() never returned: it is waiting for the failed submit's task";
-    if (returned) {
-        stopper.join();
-    } else {
-        // Failure path only. The stopper is stuck joining a worker that will
-        // never leave, so let both go: the process can still exit, and ctest
-        // runs each test in its own process, so nothing else shares it.
-        stopper.detach();
-        static_cast<void>(pool.release());
-    }
 }
 
 // A submit() that fails while building its task leaves the pool untouched:
@@ -231,22 +189,10 @@ TEST_P(ThreadPoolAllocFailure, FailedTaskConstructionReservesNothing) {
         << "the idle worker burned " << idle_cpu_ms << " ms of CPU over a " << kIdleWindow.count()
         << " ms window: it is rescanning for a task a failed submit left reserved";
 
-    // stop() on another thread, with a bound; see FailedPushReleasesItsReservation.
-    auto stop_returned = std::make_shared<std::promise<void>>();
-    std::future<void> stopped = stop_returned->get_future();
-    std::thread stopper{[target = pool.get(), stop_returned] {
-        target->stop();
-        stop_returned->set_value();
-    }};
-    const bool returned = stopped.wait_for(kStopBound) == std::future_status::ready;
+    // stop() with a bound; see FailedPushReleasesItsReservation.
+    const bool returned = stop_within(pool, kStopBound);
     EXPECT_EQ(returned ? "returned" : "timeout", std::string{"returned"})
         << "stop() never returned: it is waiting for a task a failed submit left reserved";
-    if (returned) {
-        stopper.join();
-    } else {
-        stopper.detach();
-        static_cast<void>(pool.release());
-    }
 }
 
 }  // namespace

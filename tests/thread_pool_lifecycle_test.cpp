@@ -1,3 +1,4 @@
+#include "test_support.hpp"
 #include "tsched/thread_pool.hpp"
 
 #include <gtest/gtest.h>
@@ -18,9 +19,9 @@
 #include <type_traits>
 #include <vector>
 
-#include <time.h>  // clock_gettime, CLOCK_PROCESS_CPUTIME_ID (POSIX)
-
 namespace {
+
+using tsched_test::process_cpu_ms;
 
 // A pool owns running threads that refer back to it, so it must never be
 // copied or moved. Checked at compile time: a violation fails the build.
@@ -248,30 +249,13 @@ TEST(ThreadPoolLifecycle, DestructorStopsAndJoinsWithoutExplicitStop) {
 
 // Behavior 10: idle workers sleep rather than spin.
 //
-// Measured as process CPU time (all threads, user + system) over an idle window
-// that starts only after every worker has started, so startup cost is excluded.
-// A parked worker is blocked in the kernel and costs ~nothing; measured locally
-// at 0.1 ms (g++) and 0.25 ms (clang++/TSan) per 250 ms window. Four spinning
-// workers cost ~1000 ms, and even one spinning worker ~250 ms, so the 50 ms
-// threshold has wide margins on both sides. Other processes cannot bill CPU time
-// to this one, so machine load cannot push a sleeping pool over the threshold.
+// Measured with process_cpu_ms() (test_support.hpp, which explains the method,
+// what it misses and why it is POSIX-only) over an idle window that starts only
+// after every worker has started, so startup cost is excluded. A parked worker
+// costs ~nothing; measured locally at 0.1 ms (g++) and 0.25 ms (clang++/TSan)
+// per 250 ms window. Four spinning workers cost ~1000 ms, and even one spinning
+// worker ~250 ms, so the 50 ms threshold has wide margins on both sides.
 //
-// Limitation: this catches spinning, not slow polling. A worker that loops on
-// sleep_for(1ms) costs only a millisecond or two over the window and would pass.
-// Telling "woken by notification" apart from "polling" would need voluntary
-// context-switch counts (getrusage ru_nvcsw), which is out of scope here.
-//
-// Portability: POSIX-only (CLOCK_PROCESS_CPUTIME_ID). A Windows port needs
-// GetProcessTimes instead. std::clock() is not a substitute: on MSVC it returns
-// wall-clock time, so a sleeping pool would appear to burn the whole window.
-double process_cpu_ms() {
-    ::timespec ts{};
-    if (::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0) {
-        ADD_FAILURE() << "clock_gettime(CLOCK_PROCESS_CPUTIME_ID) failed";
-    }
-    return static_cast<double>(ts.tv_sec) * 1000.0 + static_cast<double>(ts.tv_nsec) / 1.0e6;
-}
-
 // This test runs no tasks. That workers sleep again AFTER running work, i.e.
 // that every count raised for a task comes back down once it is taken, is
 // pinned elsewhere, in both stealing modes: by the two ThreadPoolAllocFailure

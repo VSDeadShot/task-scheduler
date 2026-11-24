@@ -1,3 +1,4 @@
+#include "test_support.hpp"
 #include "tsched/detail/task.hpp"
 
 #include <gtest/gtest.h>
@@ -12,6 +13,7 @@
 namespace {
 
 using tsched::detail::Task;
+using tsched_test::status_within;
 
 // A task runs once, so it can be moved but never copied: a copy could run the
 // same work twice. Moves must not throw, so handing a Task to a queue can only
@@ -19,20 +21,6 @@ using tsched::detail::Task;
 static_assert(!std::is_copy_constructible_v<Task>, "Task must not be copy-constructible");
 static_assert(!std::is_copy_assignable_v<Task>, "Task must not be copy-assignable");
 static_assert(std::is_nothrow_move_constructible_v<Task>, "Task moves must not throw");
-
-// Whether the future already holds a result, by name, so a failed check reads
-// "timeout" rather than the raw bytes GoogleTest prints for std::future_status.
-std::string status_now(const std::future<int>& result) {
-    switch (result.wait_for(std::chrono::seconds(0))) {
-        case std::future_status::ready:
-            return "ready";
-        case std::future_status::timeout:
-            return "timeout";
-        case std::future_status::deferred:
-            return "deferred";
-    }
-    return "unknown";
-}
 
 // Building and moving a Task must not run it; running it runs the callable once.
 TEST(Task, RunInvokesTheCallableExactlyOnce) {
@@ -51,10 +39,10 @@ TEST(Task, DeliversAPackagedTaskValueThroughItsFuture) {
     std::packaged_task<int()> work{[] { return 42; }};
     std::future<int> result = work.get_future();
     Task task{std::move(work)};
-    EXPECT_EQ(status_now(result), "timeout") << "the result was ready before run()";
+    EXPECT_EQ(status_within(result, std::chrono::milliseconds(0)), "timeout") << "the result was ready before run()";
 
     std::move(task).run();
-    ASSERT_EQ(status_now(result), "ready");
+    ASSERT_EQ(status_within(result, std::chrono::milliseconds(0)), "ready");
     EXPECT_EQ(result.get(), 42);
 }
 
@@ -66,7 +54,7 @@ TEST(Task, DeliversAPackagedTaskExceptionThroughItsFuture) {
     Task task{std::move(work)};
 
     EXPECT_NO_THROW(std::move(task).run());
-    ASSERT_EQ(status_now(result), "ready");
+    ASSERT_EQ(status_within(result, std::chrono::milliseconds(0)), "ready");
     try {
         result.get();
         FAIL() << "get() returned instead of rethrowing";
